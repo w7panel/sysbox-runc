@@ -62,6 +62,45 @@ func genSeccompWhitelist(syscalls []string) []specs.LinuxSyscall {
 	return specSyscalls
 }
 
+func TestNegativeTimeOffset(t *testing.T) {
+	offset, err := negativeTimeOffset("123.45")
+	if err != nil {
+		t.Fatalf("negativeTimeOffset() error = %v", err)
+	}
+
+	if offset.Secs != -124 || offset.Nanosecs != 550000000 {
+		t.Fatalf("negativeTimeOffset() = %+v, want secs=-124 nanosecs=550000000", offset)
+	}
+}
+
+func TestCfgNamespacesAddsDefaultTimeOffsets(t *testing.T) {
+	spec := &specs.Spec{
+		Linux: &specs.Linux{
+			Namespaces: []specs.LinuxNamespace{
+				{Type: specs.PIDNamespace},
+				{Type: specs.IPCNamespace},
+				{Type: specs.UTSNamespace},
+				{Type: specs.MountNamespace},
+				{Type: specs.NetworkNamespace},
+			},
+		},
+	}
+
+	if err := cfgNamespaces(&sysbox.Mgr{}, spec); err != nil {
+		t.Fatalf("cfgNamespaces() error = %v", err)
+	}
+
+	if spec.Linux.TimeOffsets == nil {
+		t.Fatal("cfgNamespaces() did not set default time offsets")
+	}
+	if _, ok := spec.Linux.TimeOffsets["monotonic"]; !ok {
+		t.Fatal("cfgNamespaces() missing monotonic offset")
+	}
+	if _, ok := spec.Linux.TimeOffsets["boottime"]; !ok {
+		t.Fatal("cfgNamespaces() missing boottime offset")
+	}
+}
+
 func TestCfgSeccomp(t *testing.T) {
 	var seccomp *specs.LinuxSeccomp
 

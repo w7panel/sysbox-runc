@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	mapset "github.com/deckarep/golang-set/v2"
@@ -341,6 +342,7 @@ func cfgNamespaces(sysMgr *sysbox.Mgr, spec *specs.Spec) error {
 	for _, ns := range spec.Linux.Namespaces {
 		specNsSet.Add(string(ns.Type))
 	}
+	hadTimeNs := specNsSet.Contains(string(specs.TimeNamespace))
 
 	if !reqNsSet.IsSubset(specNsSet) {
 		return fmt.Errorf("sysbox containers can't share namespaces %v with the host (because they use the linux user-namespace for isolation)", reqNsSet.Difference(specNsSet).ToSlice())
@@ -355,6 +357,15 @@ func cfgNamespaces(sysMgr *sysbox.Mgr, spec *specs.Spec) error {
 		}
 		spec.Linux.Namespaces = append(spec.Linux.Namespaces, newns)
 		logrus.Debugf("added namespace %s to spec", ns)
+	}
+
+	if !hadTimeNs && spec.Linux.TimeOffsets == nil {
+		offsets, err := containerTimeOffsets()
+		if err != nil {
+			logrus.Warnf("failed to configure default time namespace offsets: %v", err)
+		} else {
+			spec.Linux.TimeOffsets = offsets
+		}
 	}
 
 	// Check if we have a sysbox-mgr override for the container's user-ns
@@ -374,6 +385,60 @@ func cfgNamespaces(sysMgr *sysbox.Mgr, spec *specs.Spec) error {
 	}
 
 	return nil
+}
+
+func containerTimeOffsets() (map[string]specs.LinuxTimeOffset, error) {
+	data, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return nil, err
+	}
+
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("invalid /proc/uptime content: %q", string(data))
+	}
+
+	offset, err := negativeTimeOffset(fields[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]specs.LinuxTimeOffset{
+		"monotonic": offset,
+		"boottime":  offset,
+	}, nil
+}
+
+func negativeTimeOffset(seconds string) (specs.LinuxTimeOffset, error) {
+	parts := strings.SplitN(seconds, ".", 2)
+	secs, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return specs.LinuxTimeOffset{}, err
+	}
+
+	nsecs := uint32(0)
+	if len(parts) == 2 {
+		frac := parts[1]
+		if len(frac) > 9 {
+			frac = frac[:9]
+		}
+		for len(frac) < 9 {
+			frac += "0"
+		}
+		parsed, err := strconv.ParseUint(frac, 10, 32)
+		if err != nil {
+			return specs.LinuxTimeOffset{}, err
+		}
+		nsecs = uint32(parsed)
+	}
+
+	if nsecs == 0 {
+		return specs.LinuxTimeOffset{Secs: -secs}, nil
+	}
+	return specs.LinuxTimeOffset{
+		Secs:     -(secs + 1),
+		Nanosecs: 1_000_000_000 - nsecs,
+	}, nil
 }
 
 // allocIDMappings performs uid and gid allocation for the system container
