@@ -381,6 +381,7 @@ var syscontSyscallAllowRestrList = []string{
 var syscallTrapList = []string{
 	"mount",
 	"umount2",
+	"sysinfo",
 }
 
 // AddSyscallTraps modifies the given libcontainer config to add seccomp-notification
