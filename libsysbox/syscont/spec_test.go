@@ -101,6 +101,85 @@ func TestCfgNamespacesAddsDefaultTimeOffsets(t *testing.T) {
 	}
 }
 
+func TestGetSpecialDirsSkipsK3sForPersistentRootfs(t *testing.T) {
+	spec := &specs.Spec{
+		Root:        &specs.Root{Path: t.TempDir()},
+		Annotations: map[string]string{rootfsRwLayerAnnotation: `[{"name":"server","volumeName":"rootfs","path":"rootfs"}]`},
+	}
+
+	dirs, err := getSpecialDirs(spec)
+	if err != nil {
+		t.Fatalf("getSpecialDirs() error = %v", err)
+	}
+	if _, found := dirs["/var/lib/rancher/k3s"]; found {
+		t.Fatal("persistent rootfs must not receive the implicit K3s data mount")
+	}
+	if kind, found := dirs["/var/lib/rancher/k3s/agent/containerd"]; !found || kind != ipcLib.MntVarLibRancherK3s {
+		t.Fatalf("persistent rootfs must retain the inner containerd backing mount, got kind=%v found=%v", kind, found)
+	}
+	if _, found := dirs["/var/lib/docker"]; !found {
+		t.Fatal("unrelated special directories must remain enabled")
+	}
+}
+
+func TestGetSpecialDirsKeepsK3sWithoutPersistentRootfs(t *testing.T) {
+	spec := &specs.Spec{Root: &specs.Root{Path: t.TempDir()}}
+
+	dirs, err := getSpecialDirs(spec)
+	if err != nil {
+		t.Fatalf("getSpecialDirs() error = %v", err)
+	}
+	if kind, found := dirs["/var/lib/rancher/k3s"]; !found || kind != ipcLib.MntVarLibRancherK3s {
+		t.Fatalf("ordinary sysbox container must keep implicit K3s mount, got kind=%v found=%v", kind, found)
+	}
+}
+
+func TestRemovePersistentRootfsK3sImageVolume(t *testing.T) {
+	rootfs := t.TempDir()
+	spec := &specs.Spec{
+		Root:        &specs.Root{Path: rootfs},
+		Annotations: map[string]string{rootfsRwLayerAnnotation: `[{"name":"server","volumeName":"rootfs","path":"rootfs"}]`},
+		Mounts: []specs.Mount{
+			{
+				Destination: "/var/lib/rancher/k3s",
+				Type:        "bind",
+				Source:      "/var/lib/rancher/k3s/agent/containerd/io.containerd.grpc.v1.cri/containers/id/volumes/hash",
+			},
+			{
+				Destination: "/data",
+				Type:        "bind",
+				Source:      "/var/lib/kubelet/pods/uid/volumes/kubernetes.io~csi/pvc/mount",
+			},
+		},
+	}
+
+	if err := removePersistentRootfsK3sImageVolume(spec); err != nil {
+		t.Fatalf("removePersistentRootfsK3sImageVolume() error = %v", err)
+	}
+	if len(spec.Mounts) != 1 || spec.Mounts[0].Destination != "/data" {
+		t.Fatalf("unexpected mounts after image volume removal: %#v", spec.Mounts)
+	}
+}
+
+func TestRemovePersistentRootfsK3sImageVolumePreservesExplicitMount(t *testing.T) {
+	spec := &specs.Spec{
+		Root:        &specs.Root{Path: t.TempDir()},
+		Annotations: map[string]string{rootfsRwLayerAnnotation: `[{"name":"server","volumeName":"rootfs","path":"rootfs"}]`},
+		Mounts: []specs.Mount{{
+			Destination: "/var/lib/rancher/k3s",
+			Type:        "bind",
+			Source:      "/var/lib/kubelet/pods/uid/volumes/kubernetes.io~csi/pvc/mount",
+		}},
+	}
+
+	if err := removePersistentRootfsK3sImageVolume(spec); err != nil {
+		t.Fatalf("removePersistentRootfsK3sImageVolume() error = %v", err)
+	}
+	if len(spec.Mounts) != 1 {
+		t.Fatalf("explicit K3s data mount must be preserved: %#v", spec.Mounts)
+	}
+}
+
 func TestCfgSeccomp(t *testing.T) {
 	var seccomp *specs.LinuxSeccomp
 

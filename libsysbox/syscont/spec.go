@@ -47,8 +47,9 @@ const (
 
 // Internal
 const (
-	defaultUid uint32 = 231072
-	defaultGid uint32 = 231072
+	defaultUid              uint32 = 231072
+	defaultGid              uint32 = 231072
+	rootfsRwLayerAnnotation        = "sysbox/rootfs-rw-layer"
 )
 
 var (
@@ -950,7 +951,43 @@ func getSpecialDirs(spec *specs.Spec) (map[string]ipcLib.MntKind, error) {
 		"/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs": ipcLib.MntVarLibContainerdOvfs,
 	}
 
+	// A persistent rootfs rw-layer already provides durable storage for K3s.
+	// Keep etcd and the rest of the data directory on that rootfs, but retain an
+	// ext4-backed mount for inner containerd to avoid overlay-on-fuse-overlayfs.
+	if spec.Annotations[rootfsRwLayerAnnotation] != "" {
+		delete(specialDirMap, innerK3sDataDir)
+		specialDirMap[filepath.Join(innerK3sDataDir, "agent/containerd")] = ipcLib.MntVarLibRancherK3s
+	}
+
 	return specialDirMap, nil
+}
+
+func removePersistentRootfsK3sImageVolume(spec *specs.Spec) error {
+	if spec.Annotations[rootfsRwLayerAnnotation] == "" {
+		return nil
+	}
+	innerK3sDataDir, err := getInnerK3sDataDirPath(spec)
+	if err != nil {
+		return err
+	}
+	filtered := make([]specs.Mount, 0, len(spec.Mounts))
+	for _, m := range spec.Mounts {
+		if m.Destination == innerK3sDataDir && isCRIImageVolumeMount(m) {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	spec.Mounts = filtered
+	return nil
+}
+
+func isCRIImageVolumeMount(m specs.Mount) bool {
+	if m.Type != "bind" {
+		return false
+	}
+	cleaned := filepath.Clean(m.Source)
+	return strings.Contains(cleaned, "/io.containerd.grpc.v1.cri/containers/") &&
+		strings.Contains(cleaned, "/volumes/")
 }
 
 // sysMgrSetupMounts requests the sysbox-mgr to setup special container mounts
@@ -964,6 +1001,9 @@ func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
 
 	specialDirMap, err := getSpecialDirs(spec)
 	if err != nil {
+		return err
+	}
+	if err := removePersistentRootfsK3sImageVolume(spec); err != nil {
 		return err
 	}
 
