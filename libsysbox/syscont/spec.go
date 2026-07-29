@@ -50,6 +50,9 @@ const (
 	defaultUid              uint32 = 231072
 	defaultGid              uint32 = 231072
 	rootfsRwLayerAnnotation        = "sysbox/rootfs-rw-layer"
+	fuseDevicePath                 = "/dev/fuse"
+	fuseDeviceMajor         int64  = 10
+	fuseDeviceMinor         int64  = 229
 )
 
 var (
@@ -638,6 +641,7 @@ func cfgMounts(spec *specs.Spec, sysbox *sysbox.Sysbox) error {
 
 	if sysMgr.Config.SyscontMode {
 		cfgSyscontMounts(sysMgr, spec)
+		ensureFuseDeviceAccess(spec)
 	}
 
 	if sysFs.Enabled() {
@@ -659,6 +663,61 @@ func cfgMounts(spec *specs.Spec, sysbox *sysbox.Sysbox) error {
 	sortMounts(spec, hasSystemd)
 
 	return nil
+}
+
+// ensureFuseDeviceAccess grants access to /dev/fuse when the higher-level
+// container manager explicitly bind-mounts that device into the container.
+// Kubernetes represents hostPath character devices as mounts rather than OCI
+// devices, so add the matching OCI device and cgroup rule here.
+func ensureFuseDeviceAccess(spec *specs.Spec) {
+	hasFuseMount := false
+	for _, mount := range spec.Mounts {
+		if filepath.Clean(mount.Destination) == fuseDevicePath {
+			hasFuseMount = true
+			break
+		}
+	}
+	if !hasFuseMount || spec.Linux == nil {
+		return
+	}
+
+	hasFuseDevice := false
+	for _, device := range spec.Linux.Devices {
+		if filepath.Clean(device.Path) == fuseDevicePath {
+			hasFuseDevice = true
+			break
+		}
+	}
+	if !hasFuseDevice {
+		mode := os.FileMode(0666)
+		spec.Linux.Devices = append(spec.Linux.Devices, specs.LinuxDevice{
+			Path:     fuseDevicePath,
+			Type:     "c",
+			Major:    fuseDeviceMajor,
+			Minor:    fuseDeviceMinor,
+			FileMode: &mode,
+		})
+	}
+
+	if spec.Linux.Resources == nil {
+		spec.Linux.Resources = &specs.LinuxResources{}
+	}
+	for _, rule := range spec.Linux.Resources.Devices {
+		if rule.Type == "c" && rule.Major != nil && rule.Minor != nil &&
+			*rule.Major == fuseDeviceMajor && *rule.Minor == fuseDeviceMinor &&
+			rule.Allow && strings.Contains(rule.Access, "r") &&
+			strings.Contains(rule.Access, "w") {
+			return
+		}
+	}
+	major, minor := fuseDeviceMajor, fuseDeviceMinor
+	spec.Linux.Resources.Devices = append(spec.Linux.Resources.Devices, specs.LinuxDeviceCgroup{
+		Allow:  true,
+		Type:   "c",
+		Major:  &major,
+		Minor:  &minor,
+		Access: "rwm",
+	})
 }
 
 // cfgSyscontMounts adds mounts required by sys containers; if the spec
@@ -951,12 +1010,13 @@ func getSpecialDirs(spec *specs.Spec) (map[string]ipcLib.MntKind, error) {
 		"/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs": ipcLib.MntVarLibContainerdOvfs,
 	}
 
-	// A persistent rootfs rw-layer already provides durable storage for K3s.
-	// Keep etcd and the rest of the data directory on that rootfs, but retain an
-	// ext4-backed mount for inner containerd to avoid overlay-on-fuse-overlayfs.
+	// A persistent rootfs rw-layer already provides durable storage for Docker,
+	// K3s, and containerd. Keep all of them on that rootfs so nested snapshotters
+	// can use the same persistent layer instead of an ephemeral host directory.
 	if spec.Annotations[rootfsRwLayerAnnotation] != "" {
+		delete(specialDirMap, innerDockerDataRoot)
 		delete(specialDirMap, innerK3sDataDir)
-		specialDirMap[filepath.Join(innerK3sDataDir, "agent/containerd")] = ipcLib.MntVarLibRancherK3s
+		delete(specialDirMap, "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs")
 	}
 
 	return specialDirMap, nil

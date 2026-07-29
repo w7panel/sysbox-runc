@@ -17,6 +17,8 @@
 package syscont
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -101,7 +103,7 @@ func TestCfgNamespacesAddsDefaultTimeOffsets(t *testing.T) {
 	}
 }
 
-func TestGetSpecialDirsSkipsK3sForPersistentRootfs(t *testing.T) {
+func TestGetSpecialDirsSkipsDockerK3sAndContainerdForPersistentRootfs(t *testing.T) {
 	spec := &specs.Spec{
 		Root:        &specs.Root{Path: t.TempDir()},
 		Annotations: map[string]string{rootfsRwLayerAnnotation: `[{"name":"server","volumeName":"rootfs","path":"rootfs"}]`},
@@ -114,15 +116,42 @@ func TestGetSpecialDirsSkipsK3sForPersistentRootfs(t *testing.T) {
 	if _, found := dirs["/var/lib/rancher/k3s"]; found {
 		t.Fatal("persistent rootfs must not receive the implicit K3s data mount")
 	}
-	if kind, found := dirs["/var/lib/rancher/k3s/agent/containerd"]; !found || kind != ipcLib.MntVarLibRancherK3s {
-		t.Fatalf("persistent rootfs must retain the inner containerd backing mount, got kind=%v found=%v", kind, found)
+	if _, found := dirs["/var/lib/rancher/k3s/agent/containerd"]; found {
+		t.Fatal("persistent rootfs must not receive the inner containerd backing mount")
 	}
-	if _, found := dirs["/var/lib/docker"]; !found {
-		t.Fatal("unrelated special directories must remain enabled")
+	if _, found := dirs["/var/lib/docker"]; found {
+		t.Fatal("persistent rootfs must not receive the implicit Docker data mount")
+	}
+	if _, found := dirs["/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs"]; found {
+		t.Fatal("persistent rootfs must not receive the implicit containerd overlay mount")
 	}
 }
 
-func TestGetSpecialDirsKeepsK3sWithoutPersistentRootfs(t *testing.T) {
+func TestGetSpecialDirsSkipsCustomDockerDataRootForPersistentRootfs(t *testing.T) {
+	rootfs := t.TempDir()
+	dockerConfigDir := filepath.Join(rootfs, "etc/docker")
+	if err := os.MkdirAll(dockerConfigDir, 0755); err != nil {
+		t.Fatalf("failed to create Docker config directory: %v", err)
+	}
+	config := "{\n  \"data-root\": \"/docker-data\"\n}\n"
+	if err := os.WriteFile(filepath.Join(dockerConfigDir, "daemon.json"), []byte(config), 0644); err != nil {
+		t.Fatalf("failed to write Docker config: %v", err)
+	}
+	spec := &specs.Spec{
+		Root:        &specs.Root{Path: rootfs},
+		Annotations: map[string]string{rootfsRwLayerAnnotation: `[{"name":"server","volumeName":"rootfs","path":"rootfs"}]`},
+	}
+
+	dirs, err := getSpecialDirs(spec)
+	if err != nil {
+		t.Fatalf("getSpecialDirs() error = %v", err)
+	}
+	if _, found := dirs["/docker-data"]; found {
+		t.Fatal("persistent rootfs must not receive the implicit custom Docker data mount")
+	}
+}
+
+func TestGetSpecialDirsKeepsDockerAndK3sWithoutPersistentRootfs(t *testing.T) {
 	spec := &specs.Spec{Root: &specs.Root{Path: t.TempDir()}}
 
 	dirs, err := getSpecialDirs(spec)
@@ -131,6 +160,50 @@ func TestGetSpecialDirsKeepsK3sWithoutPersistentRootfs(t *testing.T) {
 	}
 	if kind, found := dirs["/var/lib/rancher/k3s"]; !found || kind != ipcLib.MntVarLibRancherK3s {
 		t.Fatalf("ordinary sysbox container must keep implicit K3s mount, got kind=%v found=%v", kind, found)
+	}
+	if kind, found := dirs["/var/lib/docker"]; !found || kind != ipcLib.MntVarLibDocker {
+		t.Fatalf("ordinary sysbox container must keep implicit Docker data mount, got kind=%v found=%v", kind, found)
+	}
+	if kind, found := dirs["/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs"]; !found || kind != ipcLib.MntVarLibContainerdOvfs {
+		t.Fatalf("ordinary sysbox container must keep implicit containerd overlay mount, got kind=%v found=%v", kind, found)
+	}
+}
+
+func TestEnsureFuseDeviceAccess(t *testing.T) {
+	spec := &specs.Spec{
+		Linux: &specs.Linux{},
+		Mounts: []specs.Mount{{
+			Source:      "/dev/fuse",
+			Destination: "/dev/fuse",
+			Type:        "bind",
+		}},
+	}
+
+	ensureFuseDeviceAccess(spec)
+	ensureFuseDeviceAccess(spec)
+
+	if len(spec.Linux.Devices) != 1 {
+		t.Fatalf("expected one fuse device, got %#v", spec.Linux.Devices)
+	}
+	device := spec.Linux.Devices[0]
+	if device.Path != fuseDevicePath || device.Type != "c" || device.Major != fuseDeviceMajor || device.Minor != fuseDeviceMinor {
+		t.Fatalf("unexpected fuse device: %#v", device)
+	}
+	if spec.Linux.Resources == nil || len(spec.Linux.Resources.Devices) != 1 {
+		t.Fatalf("expected one fuse cgroup rule, got %#v", spec.Linux.Resources)
+	}
+	rule := spec.Linux.Resources.Devices[0]
+	if !rule.Allow || rule.Type != "c" || rule.Major == nil || *rule.Major != fuseDeviceMajor ||
+		rule.Minor == nil || *rule.Minor != fuseDeviceMinor || rule.Access != "rwm" {
+		t.Fatalf("unexpected fuse cgroup rule: %#v", rule)
+	}
+}
+
+func TestEnsureFuseDeviceAccessRequiresExplicitMount(t *testing.T) {
+	spec := &specs.Spec{Linux: &specs.Linux{}}
+	ensureFuseDeviceAccess(spec)
+	if len(spec.Linux.Devices) != 0 || spec.Linux.Resources != nil {
+		t.Fatalf("fuse access must not be added without an explicit mount: %#v", spec.Linux)
 	}
 }
 
