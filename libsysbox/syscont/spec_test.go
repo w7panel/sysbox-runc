@@ -686,11 +686,10 @@ func Test_getSysboxEnvVarConfigs(t *testing.T) {
 		resSbox *sysbox.Sysbox
 	}{
 		{
-			// Test-case 1: Unknown SYSBOX env-var. No error expected; Kubernetes
-			// service-link env vars can legally use the SYSBOX_ prefix.
+			// Test-case 1: Unknown SYSBOX env-var. Expected error.
 			name:    "unknown-sysbox-envvar",
 			args:    args{p: &specs.Process{Env: []string{"SYSBOX_ENV=1"}}, sbox: &sysbox.Sysbox{}},
-			wantErr: false,
+			wantErr: true,
 		},
 		{
 			// Test-case 2: Invalid format for generic env-var. Error expected.

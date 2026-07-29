@@ -1190,14 +1190,18 @@ func getSysboxEnvVarConfigs(p *specs.Process, sbox *sysbox.Sysbox) error {
 			continue
 		}
 
-		evName, evVal, found := strings.Cut(ev, "=")
-		envVarType, ok := knownEnvVars[evName]
-		if !ok {
-			continue
+		tokens := strings.Split(ev, "=")
+		if len(tokens) != 2 {
+			return fmt.Errorf("env var %s has incorrect format; expected VAR=VALUE.", ev)
 		}
 
-		if !found {
-			return fmt.Errorf("env var %s has incorrect format; expected VAR=VALUE.", ev)
+		evName := tokens[0]
+		evVal := tokens[1]
+
+		// If a SYSBOX_* env var is specified, it must be one of the supported ones.
+		envVarType, ok := knownEnvVars[evName]
+		if !ok {
+			return fmt.Errorf("invalid env var %s; must be one of %v", evName, knownEnvVars)
 		}
 
 		switch envVarType {
