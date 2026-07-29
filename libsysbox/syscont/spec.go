@@ -47,12 +47,11 @@ const (
 
 // Internal
 const (
-	defaultUid              uint32 = 231072
-	defaultGid              uint32 = 231072
-	rootfsRwLayerAnnotation        = "sysbox/rootfs-rw-layer"
-	fuseDevicePath                 = "/dev/fuse"
-	fuseDeviceMajor         int64  = 10
-	fuseDeviceMinor         int64  = 229
+	defaultUid      uint32 = 231072
+	defaultGid      uint32 = 231072
+	fuseDevicePath         = "/dev/fuse"
+	fuseDeviceMajor int64  = 10
+	fuseDeviceMinor int64  = 229
 )
 
 var (
@@ -1001,31 +1000,19 @@ func getSpecialDirs(spec *specs.Spec) (map[string]ipcLib.MntKind, error) {
 
 	// These directories in the sys container are bind-mounted from host dirs managed by sysbox-mgr
 	specialDirMap := map[string]ipcLib.MntKind{
-		innerDockerDataRoot: ipcLib.MntVarLibDocker,
-		"/var/lib/kubelet":  ipcLib.MntVarLibKubelet,
-		"/var/lib/k0s":      ipcLib.MntVarLibK0s,
-		innerK3sDataDir:     ipcLib.MntVarLibRancherK3s,
-		innerRke2DataDir:    ipcLib.MntVarLibRancherRke2,
-		"/var/lib/buildkit": ipcLib.MntVarLibBuildkit,
+		innerDockerDataRoot:                     ipcLib.MntVarLibDocker,
+		"/var/lib/kubelet":                      ipcLib.MntVarLibKubelet,
+		"/var/lib/k0s":                          ipcLib.MntVarLibK0s,
+		filepath.Join(innerK3sDataDir, "agent"): ipcLib.MntVarLibRancherK3s,
+		innerRke2DataDir:                        ipcLib.MntVarLibRancherRke2,
+		"/var/lib/buildkit":                     ipcLib.MntVarLibBuildkit,
 		"/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs": ipcLib.MntVarLibContainerdOvfs,
-	}
-
-	// A persistent rootfs rw-layer already provides durable storage for Docker,
-	// K3s, and containerd. Keep all of them on that rootfs so nested snapshotters
-	// can use the same persistent layer instead of an ephemeral host directory.
-	if spec.Annotations[rootfsRwLayerAnnotation] != "" {
-		delete(specialDirMap, innerDockerDataRoot)
-		delete(specialDirMap, innerK3sDataDir)
-		delete(specialDirMap, "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs")
 	}
 
 	return specialDirMap, nil
 }
 
-func removePersistentRootfsK3sImageVolume(spec *specs.Spec) error {
-	if spec.Annotations[rootfsRwLayerAnnotation] == "" {
-		return nil
-	}
+func removeK3sImageVolume(spec *specs.Spec) error {
 	innerK3sDataDir, err := getInnerK3sDataDirPath(spec)
 	if err != nil {
 		return err
@@ -1063,10 +1050,9 @@ func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
 	if err != nil {
 		return err
 	}
-	if err := removePersistentRootfsK3sImageVolume(spec); err != nil {
+	if err := removeK3sImageVolume(spec); err != nil {
 		return err
 	}
-
 	// If the spec has a host bind-mount over one of the special dirs, ask the
 	// sysbox-mgr to prepare the mount source (e.g., chown files to match the
 	// container host uid & gid).
