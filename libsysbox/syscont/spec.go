@@ -981,7 +981,13 @@ func getInnerRke2DataDirPath(spec *specs.Spec) (string, error) {
 	return val, nil
 }
 
-func getSpecialDirs(spec *specs.Spec) (map[string]ipcLib.MntKind, error) {
+type specialDirInfo struct {
+	name        string
+	destination string
+	kind        ipcLib.MntKind
+}
+
+func getSpecialDirInfos(spec *specs.Spec) ([]specialDirInfo, error) {
 
 	innerDockerDataRoot, err := getInnerDockerDataRootPath(spec)
 	if err != nil {
@@ -998,17 +1004,28 @@ func getSpecialDirs(spec *specs.Spec) (map[string]ipcLib.MntKind, error) {
 		return nil, err
 	}
 
-	// These directories in the sys container are bind-mounted from host dirs managed by sysbox-mgr
-	specialDirMap := map[string]ipcLib.MntKind{
-		innerDockerDataRoot:                     ipcLib.MntVarLibDocker,
-		"/var/lib/kubelet":                      ipcLib.MntVarLibKubelet,
-		"/var/lib/k0s":                          ipcLib.MntVarLibK0s,
-		filepath.Join(innerK3sDataDir, "agent"): ipcLib.MntVarLibRancherK3s,
-		innerRke2DataDir:                        ipcLib.MntVarLibRancherRke2,
-		"/var/lib/buildkit":                     ipcLib.MntVarLibBuildkit,
-		"/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs": ipcLib.MntVarLibContainerdOvfs,
+	return []specialDirInfo{
+		{name: "docker", destination: innerDockerDataRoot, kind: ipcLib.MntVarLibDocker},
+		{name: "kubelet", destination: "/var/lib/kubelet", kind: ipcLib.MntVarLibKubelet},
+		{name: "k0s", destination: "/var/lib/k0s", kind: ipcLib.MntVarLibK0s},
+		{name: "k3s-agent", destination: filepath.Join(innerK3sDataDir, "agent"), kind: ipcLib.MntVarLibRancherK3s},
+		{name: "rke2", destination: innerRke2DataDir, kind: ipcLib.MntVarLibRancherRke2},
+		{name: "buildkit", destination: "/var/lib/buildkit", kind: ipcLib.MntVarLibBuildkit},
+		{name: "containerd-overlay", destination: "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs", kind: ipcLib.MntVarLibContainerdOvfs},
+	}, nil
+}
+
+func getSpecialDirs(spec *specs.Spec) (map[string]ipcLib.MntKind, error) {
+	infos, err := getSpecialDirInfos(spec)
+	if err != nil {
+		return nil, err
 	}
 
+	// These directories in the sys container are bind-mounted from host dirs managed by sysbox-mgr.
+	specialDirMap := make(map[string]ipcLib.MntKind, len(infos))
+	for _, info := range infos {
+		specialDirMap[info.destination] = info.kind
+	}
 	return specialDirMap, nil
 }
 

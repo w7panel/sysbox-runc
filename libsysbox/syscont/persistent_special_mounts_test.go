@@ -23,7 +23,11 @@ func persistentSpecialTestSpec(t *testing.T, podsDir, podUID, layerPath string) 
 	rootfs := t.TempDir()
 	for _, path := range []string{
 		"var/lib/docker",
+		"var/lib/kubelet",
+		"var/lib/k0s",
 		"var/lib/rancher/k3s/agent",
+		"var/lib/rancher/rke2",
+		"var/lib/buildkit",
 		"var/lib/containerd/io.containerd.snapshotter.v1.overlayfs",
 	} {
 		if err := os.MkdirAll(filepath.Join(rootfs, path), 0o755); err != nil {
@@ -81,6 +85,11 @@ func TestCfgPersistentSpecialMountsSkipsPodSandbox(t *testing.T) {
 func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) {
 	podsDir := t.TempDir()
 	spec, pvcRoot := persistentSpecialTestSpec(t, podsDir, "pod-uid", "containers/app")
+	spec.Mounts = append(spec.Mounts, specs.Mount{
+		Source:      "/node-local-kubelet",
+		Destination: "/var/lib/kubelet",
+		Type:        "bind",
+	})
 	copyCount := 0
 	copyDir := func(source, destination string) error {
 		copyCount++
@@ -93,8 +102,8 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 	if err := initializePersistentSpecial(spec, config, copyDir); err != nil {
 		t.Fatal(err)
 	}
-	if copyCount != 3 {
-		t.Fatalf("copied %d image directories, want 3", copyCount)
+	if copyCount != 7 {
+		t.Fatalf("copied %d image directories, want 7", copyCount)
 	}
 	for _, mapping := range config.meta.Mappings {
 		if _, err := os.Stat(filepath.Join(config.specialRoot, mapping.Name, "from-image")); err != nil {
@@ -114,8 +123,8 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 	if err := cfgPersistentSpecialMountsAt(spec, podsDir); err != nil {
 		t.Fatal(err)
 	}
-	if len(spec.Mounts) != 3 {
-		t.Fatalf("got %d mounts, want 3: %#v", len(spec.Mounts), spec.Mounts)
+	if len(spec.Mounts) != 7 {
+		t.Fatalf("got %d mounts, want 7: %#v", len(spec.Mounts), spec.Mounts)
 	}
 	for index, mapping := range config.meta.Mappings {
 		mount := spec.Mounts[index]
@@ -123,6 +132,11 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 			mount.Destination != mapping.Destination || mount.Type != "bind" ||
 			!reflect.DeepEqual(mount.Options, []string{"rbind", "rprivate"}) {
 			t.Fatalf("unexpected persistent mount: %#v", mount)
+		}
+	}
+	for _, mount := range spec.Mounts {
+		if mount.Source == "/node-local-kubelet" {
+			t.Fatalf("node-local special mount was not replaced: %#v", mount)
 		}
 	}
 }
@@ -203,12 +217,44 @@ func TestResolvePersistentSpecialConfigUsesCustomDestinations(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(spec.Root.Path, "etc/rancher/k3s/config.yaml"), []byte("data-dir: /k3s-data\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(spec.Root.Path, "etc/rancher/rke2"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(spec.Root.Path, "etc/rancher/rke2/config.yaml"), []byte("data-dir: /rke2-data\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	config, enabled, err := resolvePersistentSpecialConfig(spec, podsDir)
 	if err != nil || !enabled {
 		t.Fatalf("resolve config: enabled=%v err=%v", enabled, err)
 	}
-	if config.meta.Mappings[0].Destination != "/docker-data" || config.meta.Mappings[1].Destination != "/k3s-data/agent" {
+	want := map[string]string{"docker": "/docker-data", "k3s-agent": "/k3s-data/agent", "rke2": "/rke2-data"}
+	for _, mapping := range config.meta.Mappings {
+		if destination, found := want[mapping.Name]; found && mapping.Destination != destination {
+			t.Fatalf("mapping %s destination = %q, want %q", mapping.Name, mapping.Destination, destination)
+		}
+		delete(want, mapping.Name)
+	}
+	if len(want) != 0 {
 		t.Fatalf("custom destinations not preserved: %#v", config.meta.Mappings)
+	}
+}
+
+func TestInitializePersistentSpecialRejectsLegacyMetadata(t *testing.T) {
+	podsDir := t.TempDir()
+	spec, _ := persistentSpecialTestSpec(t, podsDir, "pod-uid", "app")
+	config, _, err := resolvePersistentSpecialConfig(spec, podsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initializePersistentSpecial(spec, config, func(string, string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	legacy := []byte(`{"version":1,"mappings":[{"name":"docker","destination":"/var/lib/docker"}]}`)
+	if err := os.WriteFile(filepath.Join(config.specialRoot, "meta.json"), legacy, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializePersistentSpecial(spec, config, func(string, string) error { return nil }); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("legacy metadata error = %v", err)
 	}
 }
 

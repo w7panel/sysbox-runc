@@ -25,7 +25,7 @@ const (
 	kubernetesContainerNameAnno  = "io.kubernetes.cri.container-name"
 	kubernetesSandboxUIDAnno     = "io.kubernetes.cri.sandbox-uid"
 	rootfsSpecialMountBase       = "/var/lib/sysbox/rootfs-special-volume"
-	persistentSpecialMetaVersion = 1
+	persistentSpecialMetaVersion = 2
 	kubeletPodsDir               = "/var/lib/kubelet/pods"
 )
 
@@ -72,11 +72,20 @@ func cfgPersistentSpecialMountsAt(spec *specs.Spec, podsDir string) error {
 	}
 
 	hiddenDest := filepath.Join(rootfsSpecialMountBase, config.entry.VolumeName)
+	persistentDestinations := make(map[string]struct{}, len(config.meta.Mappings))
+	for _, mapping := range config.meta.Mappings {
+		persistentDestinations[filepath.Clean(mapping.Destination)] = struct{}{}
+	}
 	filtered := make([]specs.Mount, 0, len(spec.Mounts)+len(config.meta.Mappings))
 	for _, mount := range spec.Mounts {
-		if filepath.Clean(mount.Destination) != hiddenDest {
-			filtered = append(filtered, mount)
+		destination := filepath.Clean(mount.Destination)
+		if destination == hiddenDest {
+			continue
 		}
+		if _, replaced := persistentDestinations[destination]; replaced {
+			continue
+		}
+		filtered = append(filtered, mount)
 	}
 	for _, mapping := range config.meta.Mappings {
 		filtered = append(filtered, specs.Mount{
@@ -178,24 +187,19 @@ func resolvePersistentSpecialConfig(spec *specs.Spec, podsDir string) (persisten
 		return persistentSpecialConfig{}, false, fmt.Errorf("resolve rootfs rw-layer path: %w", err)
 	}
 
-	dockerRoot, err := getInnerDockerDataRootPath(spec)
+	infos, err := getSpecialDirInfos(spec)
 	if err != nil {
 		return persistentSpecialConfig{}, false, err
 	}
-	k3sRoot, err := getInnerK3sDataDirPath(spec)
-	if err != nil {
-		return persistentSpecialConfig{}, false, err
-	}
-	for name, destination := range map[string]string{"Docker data-root": dockerRoot, "K3s data-dir": k3sRoot} {
-		if !filepath.IsAbs(destination) || filepath.Clean(destination) == string(filepath.Separator) {
-			return persistentSpecialConfig{}, false, fmt.Errorf("%s %q must be an absolute non-root path", name, destination)
+	mappings := make([]persistentSpecialMapping, 0, len(infos))
+	for _, info := range infos {
+		destination := filepath.Clean(info.destination)
+		if !filepath.IsAbs(destination) || destination == string(filepath.Separator) {
+			return persistentSpecialConfig{}, false, fmt.Errorf("special directory %s destination %q must be an absolute non-root path", info.name, info.destination)
 		}
+		mappings = append(mappings, persistentSpecialMapping{Name: info.name, Destination: destination})
 	}
-	meta := persistentSpecialMeta{Version: persistentSpecialMetaVersion, Mappings: []persistentSpecialMapping{
-		{Name: "docker", Destination: filepath.Clean(dockerRoot)},
-		{Name: "k3s-agent", Destination: filepath.Join(filepath.Clean(k3sRoot), "agent")},
-		{Name: "containerd-overlay", Destination: "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs"},
-	}}
+	meta := persistentSpecialMeta{Version: persistentSpecialMetaVersion, Mappings: mappings}
 	return persistentSpecialConfig{
 		entry:       entry,
 		pvcRoot:     pvcRoot,
