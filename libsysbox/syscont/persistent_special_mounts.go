@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 
 	securejoin "github.com/cyphar/filepath-securejoin"
@@ -22,10 +24,11 @@ import (
 
 const (
 	rootfsRwLayerAnnotation      = "sysbox/rootfs-rw-layer"
+	persistentSpecialAnnotation  = "sysbox/persistent-special-mounts"
 	kubernetesContainerNameAnno  = "io.kubernetes.cri.container-name"
 	kubernetesSandboxUIDAnno     = "io.kubernetes.cri.sandbox-uid"
 	rootfsSpecialMountBase       = "/var/lib/sysbox/rootfs-special-volume"
-	persistentSpecialMetaVersion = 2
+	persistentSpecialMetaVersion = 3
 	kubeletPodsDir               = "/var/lib/kubelet/pods"
 )
 
@@ -55,8 +58,8 @@ type persistentSpecialConfig struct {
 
 // cfgPersistentSpecialMounts converts the admission-injected, hidden PVC mount
 // into explicit mounts for data that Sysbox otherwise stores in node-local
-// special volumes. Containers without a matching rw-layer entry retain the
-// legacy behavior.
+// special volumes. This behavior is explicitly opt-in so existing containers
+// retain the legacy node-local special-volume behavior after a Sysbox upgrade.
 func cfgPersistentSpecialMounts(spec *specs.Spec) error {
 	return cfgPersistentSpecialMountsAt(spec, kubeletPodsDir)
 }
@@ -100,6 +103,9 @@ func cfgPersistentSpecialMountsAt(spec *specs.Spec, podsDir string) error {
 }
 
 func resolvePersistentSpecialConfig(spec *specs.Spec, podsDir string) (persistentSpecialConfig, bool, error) {
+	if spec.Annotations[persistentSpecialAnnotation] != "true" {
+		return persistentSpecialConfig{}, false, nil
+	}
 	raw := spec.Annotations[rootfsRwLayerAnnotation]
 	if raw == "" {
 		return persistentSpecialConfig{}, false, nil
@@ -295,7 +301,9 @@ func rejectPersistentSpecialSymlinks(root, target string) error {
 	return nil
 }
 
-func initializePersistentSpecial(spec *specs.Spec, config persistentSpecialConfig, copyDir func(string, string) error) error {
+type persistentSpecialCopyDir func(string, string, []specs.LinuxIDMapping, []specs.LinuxIDMapping) error
+
+func initializePersistentSpecial(spec *specs.Spec, config persistentSpecialConfig, copyDir persistentSpecialCopyDir) error {
 	if err := os.MkdirAll(config.layerRoot, 0o755); err != nil {
 		return fmt.Errorf("create persistent special layer root: %w", err)
 	}
@@ -349,7 +357,7 @@ func initializePersistentSpecial(spec *specs.Spec, config persistentSpecialConfi
 		if !info.IsDir() {
 			return fmt.Errorf("image special path %s is not a directory", mapping.Destination)
 		}
-		if err := copyDir(source, destination); err != nil {
+		if err := copyDir(source, destination, spec.Linux.UIDMappings, spec.Linux.GIDMappings); err != nil {
 			return fmt.Errorf("initialize persistent special directory %s: %w", mapping.Name, err)
 		}
 	}
@@ -407,11 +415,92 @@ func validatePersistentSpecial(config persistentSpecialConfig) error {
 	return nil
 }
 
-func rsyncPersistentSpecialDir(source, destination string) error {
-	command := exec.Command("rsync", "-aHAX", "--numeric-ids", "--one-file-system", source+string(filepath.Separator), destination+string(filepath.Separator))
+func rsyncPersistentSpecialDir(source, destination string, uidMappings, gidMappings []specs.LinuxIDMapping) error {
+	uidMap, gidMap, err := persistentSpecialRsyncIDMaps(source, uidMappings, gidMappings)
+	if err != nil {
+		return err
+	}
+	args := []string{"-aHAX", "--numeric-ids", "--one-file-system"}
+	if uidMap != "" {
+		args = append(args, "--usermap="+uidMap)
+	}
+	if gidMap != "" {
+		args = append(args, "--groupmap="+gidMap)
+	}
+	args = append(args, source+string(filepath.Separator), destination+string(filepath.Separator))
+	command := exec.Command("rsync", args...)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("rsync failed: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func persistentSpecialRsyncIDMaps(root string, uidMappings, gidMappings []specs.LinuxIDMapping) (string, string, error) {
+	uids := map[uint32]struct{}{}
+	gids := map[uint32]struct{}{}
+	err := filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		var stat unix.Stat_t
+		if err := unix.Lstat(path, &stat); err != nil {
+			return err
+		}
+		uids[stat.Uid] = struct{}{}
+		gids[stat.Gid] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("scan persistent special source: %w", err)
+	}
+	uidMap, err := persistentSpecialRsyncIDMap(uids, uidMappings)
+	if err != nil {
+		return "", "", fmt.Errorf("map persistent special uids: %w", err)
+	}
+	gidMap, err := persistentSpecialRsyncIDMap(gids, gidMappings)
+	if err != nil {
+		return "", "", fmt.Errorf("map persistent special gids: %w", err)
+	}
+	return uidMap, gidMap, nil
+}
+
+func persistentSpecialRsyncIDMap(ids map[uint32]struct{}, mappings []specs.LinuxIDMapping) (string, error) {
+	type idPair struct {
+		from uint32
+		to   uint32
+	}
+	pairs := make([]idPair, 0, len(ids))
+	for id := range ids {
+		mapped, found, err := persistentSpecialContainerID(id, mappings)
+		if err != nil {
+			return "", err
+		}
+		if found && mapped != id {
+			pairs = append(pairs, idPair{from: id, to: mapped})
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].from < pairs[j].from })
+	result := make([]string, 0, len(pairs))
+	for _, pair := range pairs {
+		result = append(result, strconv.FormatUint(uint64(pair.from), 10)+":"+strconv.FormatUint(uint64(pair.to), 10))
+	}
+	return strings.Join(result, ","), nil
+}
+
+func persistentSpecialContainerID(id uint32, mappings []specs.LinuxIDMapping) (uint32, bool, error) {
+	for _, mapping := range mappings {
+		if mapping.Size == 0 {
+			return 0, false, fmt.Errorf("ID mapping size is zero")
+		}
+		hostEnd := uint64(mapping.HostID) + uint64(mapping.Size)
+		containerEnd := uint64(mapping.ContainerID) + uint64(mapping.Size)
+		if hostEnd > uint64(^uint32(0))+1 || containerEnd > uint64(^uint32(0))+1 {
+			return 0, false, fmt.Errorf("ID mapping overflows uint32")
+		}
+		if uint64(id) >= uint64(mapping.HostID) && uint64(id) < hostEnd {
+			return mapping.ContainerID + (id - mapping.HostID), true, nil
+		}
+	}
+	return id, false, nil
 }
