@@ -145,7 +145,7 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 	if err != nil || !enabled {
 		t.Fatalf("resolve config: enabled=%v err=%v", enabled, err)
 	}
-	if err := initializePersistentUpperMounts(config); err != nil {
+	if err := initializePersistentUpperMounts(spec, config); err != nil {
 		t.Fatal(err)
 	}
 	for _, mapping := range config.mappings {
@@ -158,17 +158,23 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 		}
 	}
 	dockerSource := filepath.Join(config.upperRoot, "var/lib/docker")
-	if _, err := os.Stat(filepath.Join(dockerSource, "from-image")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("image preload unexpectedly copied: %v", err)
+	if data, err := os.ReadFile(filepath.Join(dockerSource, "from-image")); err != nil || string(data) != "preloaded" {
+		t.Fatalf("image preload = %q err=%v", data, err)
 	}
 	if err := os.WriteFile(filepath.Join(dockerSource, "persistent"), []byte("data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := initializePersistentUpperMounts(config); err != nil {
+	if err := os.WriteFile(filepath.Join(spec.Root.Path, "var/lib/docker/after-first"), []byte("new-image-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializePersistentUpperMounts(spec, config); err != nil {
 		t.Fatalf("reuse failed: %v", err)
 	}
 	if data, err := os.ReadFile(filepath.Join(dockerSource, "persistent")); err != nil || string(data) != "data" {
 		t.Fatalf("persistent data = %q err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(dockerSource, "after-first")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("existing PVC directory was re-seeded: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(config.layerRoot, "special")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("special directory err = %v, want not exist", err)
@@ -193,6 +199,77 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 		if mount.Source == "/node-local-kubelet" {
 			t.Fatalf("node-local special mount was not replaced: %#v", mount)
 		}
+	}
+}
+
+func TestInitializePersistentUpperMountsCreatesEmptyDirectoryForMissingImagePath(t *testing.T) {
+	rootfs := t.TempDir()
+	upperRoot := filepath.Join(t.TempDir(), "upper")
+	spec := &specs.Spec{Root: &specs.Root{Path: rootfs}}
+	config := persistentSpecialConfig{
+		layerRoot: filepath.Dir(upperRoot),
+		upperRoot: upperRoot,
+		mappings:  []persistentSpecialMapping{{Name: "missing", Destination: "/var/lib/missing"}},
+	}
+	if err := initializePersistentUpperMounts(spec, config); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(upperRoot, "var/lib/missing")
+	entries, err := os.ReadDir(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("missing image path initialized with entries: %#v", entries)
+	}
+}
+
+func TestInitializePersistentUpperMountsRejectsInvalidImageSource(t *testing.T) {
+	tests := []struct {
+		name   string
+		create func(t *testing.T, path string)
+	}{
+		{
+			name: "regular file",
+			create: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("not a directory"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlink",
+			create: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Symlink(t.TempDir(), path); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rootfs := t.TempDir()
+			source := filepath.Join(rootfs, "var/lib/docker")
+			if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			test.create(t, source)
+			upperRoot := filepath.Join(t.TempDir(), "upper")
+			spec := &specs.Spec{Root: &specs.Root{Path: rootfs}}
+			config := persistentSpecialConfig{
+				layerRoot: filepath.Dir(upperRoot),
+				upperRoot: upperRoot,
+				mappings:  []persistentSpecialMapping{{Name: "docker", Destination: "/var/lib/docker"}},
+			}
+			if err := initializePersistentUpperMounts(spec, config); err == nil {
+				t.Fatal("expected invalid image source error")
+			}
+			if _, err := os.Stat(filepath.Join(upperRoot, "var/lib/docker")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("invalid image source published a target: %v", err)
+			}
+		})
 	}
 }
 
@@ -431,12 +508,12 @@ func TestInitializePersistentUpperMountsRejectsInvalidPaths(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := initializePersistentUpperMounts(config); err != nil {
+			if err := initializePersistentUpperMounts(spec, config); err != nil {
 				t.Fatal(err)
 			}
 			dockerPath := filepath.Join(config.upperRoot, "var/lib/docker")
 			test.mutate(t, config.upperRoot, dockerPath)
-			if err := initializePersistentUpperMounts(config); err == nil {
+			if err := initializePersistentUpperMounts(spec, config); err == nil {
 				t.Fatal("expected invalid upper path error")
 			}
 		})
@@ -450,7 +527,7 @@ func TestInitializePersistentUpperMountsUsesChangedDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := initializePersistentUpperMounts(config); err != nil {
+	if err := initializePersistentUpperMounts(spec, config); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(spec.Root.Path, "etc/docker"), 0o755); err != nil {
@@ -463,7 +540,7 @@ func TestInitializePersistentUpperMountsUsesChangedDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := initializePersistentUpperMounts(changed); err != nil {
+	if err := initializePersistentUpperMounts(spec, changed); err != nil {
 		t.Fatal(err)
 	}
 	if info, err := os.Stat(filepath.Join(changed.upperRoot, "docker-data")); err != nil || !info.IsDir() {

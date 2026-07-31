@@ -11,7 +11,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 
 	securejoin "github.com/cyphar/filepath-securejoin"
@@ -74,7 +77,7 @@ func cfgPersistentSpecialMountsWithHandoffAt(spec *specs.Spec, podsDir, handoffD
 		return err
 	}
 
-	if err := initializePersistentUpperMounts(config); err != nil {
+	if err := initializePersistentUpperMounts(spec, config); err != nil {
 		return err
 	}
 
@@ -375,7 +378,14 @@ func rejectPersistentSpecialSymlinks(root, target string) error {
 	return nil
 }
 
-func initializePersistentUpperMounts(config persistentSpecialConfig) error {
+// initializePersistentUpperMounts creates the raw-upper mount sources. On their
+// first creation, it seeds each source from the merged image rootfs before runc
+// installs the bind mount that would otherwise hide the image contents. Existing
+// directories are PVC state and are never re-seeded or overwritten.
+func initializePersistentUpperMounts(spec *specs.Spec, config persistentSpecialConfig) error {
+	if spec == nil || spec.Root == nil || spec.Root.Path == "" {
+		return fmt.Errorf("container rootfs is missing")
+	}
 	if err := os.MkdirAll(config.layerRoot, 0o755); err != nil {
 		return fmt.Errorf("create persistent upper layer root: %w", err)
 	}
@@ -395,16 +405,83 @@ func initializePersistentUpperMounts(config persistentSpecialConfig) error {
 	}
 	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN) //nolint:errcheck
 
+	rootfs, err := filepath.Abs(spec.Root.Path)
+	if err != nil {
+		return fmt.Errorf("resolve container rootfs: %w", err)
+	}
 	for _, mapping := range config.mappings {
-		source, err := persistentUpperMountSource(config, mapping)
+		destination, err := persistentUpperMountSource(config, mapping)
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(source, 0o755); err != nil {
-			return fmt.Errorf("create persistent upper directory %s: %w", mapping.Destination, err)
+		info, statErr := os.Lstat(destination)
+		if statErr == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return fmt.Errorf("persistent upper directory %s is missing or invalid", mapping.Destination)
+			}
+			continue
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("stat persistent upper directory %s: %w", mapping.Destination, statErr)
+		}
+
+		var uidMappings, gidMappings []specs.LinuxIDMapping
+		if spec.Linux != nil {
+			uidMappings = spec.Linux.UIDMappings
+			gidMappings = spec.Linux.GIDMappings
+		}
+		if err := seedPersistentUpperDirectory(rootfs, destination, mapping, uidMappings, gidMappings); err != nil {
+			return err
 		}
 	}
 	return validatePersistentUpperMounts(config)
+}
+
+// seedPersistentUpperDirectory publishes one initialized directory atomically.
+// Its destination is intentionally not created before the seed completes: the
+// existence of that directory is the durable indication that PVC state owns it.
+func seedPersistentUpperDirectory(rootfs, destination string, mapping persistentSpecialMapping, uidMappings, gidMappings []specs.LinuxIDMapping) error {
+	parent := filepath.Dir(destination)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return fmt.Errorf("create persistent upper parent for %s: %w", mapping.Destination, err)
+	}
+	staging, err := os.MkdirTemp(parent, "."+filepath.Base(destination)+".seed-")
+	if err != nil {
+		return fmt.Errorf("create persistent upper staging directory %s: %w", mapping.Destination, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.RemoveAll(staging)
+		}
+	}()
+
+	relative := strings.TrimPrefix(filepath.Clean(mapping.Destination), string(filepath.Separator))
+	lexicalSource := filepath.Join(rootfs, relative)
+	if err := rejectPersistentSpecialSymlinks(rootfs, lexicalSource); err != nil {
+		return fmt.Errorf("validate image special directory %s: %w", mapping.Destination, err)
+	}
+	source, err := securejoin.SecureJoin(rootfs, relative)
+	if err != nil {
+		return fmt.Errorf("resolve image special directory %s: %w", mapping.Destination, err)
+	}
+	info, err := os.Lstat(source)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("image special path %s is not a real directory", mapping.Destination)
+		}
+		if err := rsyncPersistentSpecialDir(source, staging, uidMappings, gidMappings); err != nil {
+			return fmt.Errorf("seed persistent upper directory %s: %w", mapping.Destination, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat image special directory %s: %w", mapping.Destination, err)
+	}
+
+	if err := os.Rename(staging, destination); err != nil {
+		return fmt.Errorf("commit persistent upper directory %s: %w", mapping.Destination, err)
+	}
+	committed = true
+	return nil
 }
 
 func openPersistentSpecialLock(path string) (*os.File, error) {
@@ -444,4 +521,94 @@ func validatePersistentUpperMounts(config persistentSpecialConfig) error {
 		}
 	}
 	return nil
+}
+
+func rsyncPersistentSpecialDir(source, destination string, uidMappings, gidMappings []specs.LinuxIDMapping) error {
+	uidMap, gidMap, err := persistentSpecialRsyncIDMaps(source, uidMappings, gidMappings)
+	if err != nil {
+		return err
+	}
+	args := []string{"-aHAX", "--numeric-ids", "--one-file-system"}
+	if uidMap != "" {
+		args = append(args, "--usermap="+uidMap)
+	}
+	if gidMap != "" {
+		args = append(args, "--groupmap="+gidMap)
+	}
+	args = append(args, source+string(filepath.Separator), destination+string(filepath.Separator))
+	command := exec.Command("rsync", args...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("rsync failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func persistentSpecialRsyncIDMaps(root string, uidMappings, gidMappings []specs.LinuxIDMapping) (string, string, error) {
+	uids := map[uint32]struct{}{}
+	gids := map[uint32]struct{}{}
+	err := filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		var stat unix.Stat_t
+		if err := unix.Lstat(path, &stat); err != nil {
+			return err
+		}
+		uids[stat.Uid] = struct{}{}
+		gids[stat.Gid] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("scan persistent special source: %w", err)
+	}
+	uidMap, err := persistentSpecialRsyncIDMap(uids, uidMappings)
+	if err != nil {
+		return "", "", fmt.Errorf("map persistent special uids: %w", err)
+	}
+	gidMap, err := persistentSpecialRsyncIDMap(gids, gidMappings)
+	if err != nil {
+		return "", "", fmt.Errorf("map persistent special gids: %w", err)
+	}
+	return uidMap, gidMap, nil
+}
+
+func persistentSpecialRsyncIDMap(ids map[uint32]struct{}, mappings []specs.LinuxIDMapping) (string, error) {
+	type idPair struct {
+		from uint32
+		to   uint32
+	}
+	pairs := make([]idPair, 0, len(ids))
+	for id := range ids {
+		mapped, found, err := persistentSpecialContainerID(id, mappings)
+		if err != nil {
+			return "", err
+		}
+		if found && mapped != id {
+			pairs = append(pairs, idPair{from: id, to: mapped})
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].from < pairs[j].from })
+	result := make([]string, 0, len(pairs))
+	for _, pair := range pairs {
+		result = append(result, strconv.FormatUint(uint64(pair.from), 10)+":"+strconv.FormatUint(uint64(pair.to), 10))
+	}
+	return strings.Join(result, ","), nil
+}
+
+func persistentSpecialContainerID(id uint32, mappings []specs.LinuxIDMapping) (uint32, bool, error) {
+	for _, mapping := range mappings {
+		if mapping.Size == 0 {
+			return 0, false, fmt.Errorf("ID mapping size is zero")
+		}
+		hostEnd := uint64(mapping.HostID) + uint64(mapping.Size)
+		containerEnd := uint64(mapping.ContainerID) + uint64(mapping.Size)
+		if hostEnd > uint64(^uint32(0))+1 || containerEnd > uint64(^uint32(0))+1 {
+			return 0, false, fmt.Errorf("ID mapping overflows uint32")
+		}
+		if uint64(id) >= uint64(mapping.HostID) && uint64(id) < hostEnd {
+			return mapping.ContainerID + (id - mapping.HostID), true, nil
+		}
+	}
+	return id, false, nil
 }
