@@ -1063,7 +1063,7 @@ func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
 	rootfsUidShiftType := sysbox.RootfsUidShiftType
 	mgr := sysbox.Mgr
 
-	if err := cfgPersistentSpecialMounts(spec); err != nil {
+	if err := cfgPersistentSpecialMounts(spec, sysbox.Id); err != nil {
 		return err
 	}
 

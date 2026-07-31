@@ -4,6 +4,9 @@
 package syscont
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,6 +16,22 @@ import (
 
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
+
+func writePersistentSpecialHandoff(t *testing.T, root, containerID string, handoff persistentSpecialHandoff) {
+	t.Helper()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(handoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(containerID))
+	path := filepath.Join(root, hex.EncodeToString(sum[:])+".json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func persistentSpecialTestSpec(t *testing.T, podsDir, podUID, layerPath string) (*specs.Spec, string) {
 	t.Helper()
@@ -170,6 +189,95 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 		if mount.Source == "/node-local-kubelet" {
 			t.Fatalf("node-local special mount was not replaced: %#v", mount)
 		}
+	}
+}
+
+func TestCfgPersistentSpecialMountsUsesSnapshotterHandoffWithoutApplicationPVCMount(t *testing.T) {
+	podsDir := t.TempDir()
+	handoffDir := t.TempDir()
+	containerID := "container-id"
+	spec, pvcRoot := persistentSpecialTestSpec(t, podsDir, "pod-uid", "containers/app")
+	spec.Mounts = nil
+	writePersistentSpecialHandoff(t, handoffDir, containerID, persistentSpecialHandoff{
+		Version:       persistentSpecialHandoffVer,
+		SnapshotKey:   containerID,
+		PodUID:        "pod-uid",
+		ContainerName: "app",
+		VolumeName:    "rootfs",
+		PVCMountPath:  pvcRoot,
+	})
+
+	if err := cfgPersistentSpecialMountsWithHandoffAt(spec, podsDir, handoffDir, containerID); err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.Mounts) != 7 {
+		t.Fatalf("got %d mounts, want 7: %#v", len(spec.Mounts), spec.Mounts)
+	}
+	for _, mount := range spec.Mounts {
+		if strings.HasPrefix(mount.Destination, rootfsSpecialMountBase) {
+			t.Fatalf("handoff mount leaked into final spec: %#v", mount)
+		}
+		if !strings.HasPrefix(mount.Source, filepath.Join(pvcRoot, "containers/app/special")+string(filepath.Separator)) {
+			t.Fatalf("persistent mount source is outside PVC special directory: %#v", mount)
+		}
+	}
+}
+
+func TestCfgPersistentSpecialMountsFailsClosedWithoutPVCSource(t *testing.T) {
+	podsDir := t.TempDir()
+	spec, _ := persistentSpecialTestSpec(t, podsDir, "pod-uid", "containers/app")
+	spec.Mounts = nil
+
+	err := cfgPersistentSpecialMountsWithHandoffAt(spec, podsDir, t.TempDir(), "container-id")
+	if err == nil || !strings.Contains(err.Error(), "PVC source is unavailable") {
+		t.Fatalf("error = %v, want unavailable PVC source", err)
+	}
+}
+
+func TestCfgPersistentSpecialMountsRejectsMismatchedHandoff(t *testing.T) {
+	podsDir := t.TempDir()
+	handoffDir := t.TempDir()
+	containerID := "container-id"
+	spec, pvcRoot := persistentSpecialTestSpec(t, podsDir, "pod-uid", "containers/app")
+	spec.Mounts = nil
+	writePersistentSpecialHandoff(t, handoffDir, containerID, persistentSpecialHandoff{
+		Version:       persistentSpecialHandoffVer,
+		SnapshotKey:   containerID,
+		PodUID:        "other-pod",
+		ContainerName: "app",
+		VolumeName:    "rootfs",
+		PVCMountPath:  pvcRoot,
+	})
+
+	_, _, err := resolvePersistentSpecialConfigWithHandoff(spec, podsDir, handoffDir, containerID)
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("error = %v, want handoff mismatch", err)
+	}
+}
+
+func TestCfgPersistentSpecialMountsRejectsUnsafeHandoffPermissions(t *testing.T) {
+	podsDir := t.TempDir()
+	handoffDir := t.TempDir()
+	containerID := "container-id"
+	spec, pvcRoot := persistentSpecialTestSpec(t, podsDir, "pod-uid", "containers/app")
+	spec.Mounts = nil
+	writePersistentSpecialHandoff(t, handoffDir, containerID, persistentSpecialHandoff{
+		Version:       persistentSpecialHandoffVer,
+		SnapshotKey:   containerID,
+		PodUID:        "pod-uid",
+		ContainerName: "app",
+		VolumeName:    "rootfs",
+		PVCMountPath:  pvcRoot,
+	})
+	sum := sha256.Sum256([]byte(containerID))
+	path := filepath.Join(handoffDir, hex.EncodeToString(sum[:])+".json")
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := resolvePersistentSpecialConfigWithHandoff(spec, podsDir, handoffDir, containerID)
+	if err == nil || !strings.Contains(err.Error(), "unsafe permissions") {
+		t.Fatalf("error = %v, want unsafe permissions", err)
 	}
 }
 

@@ -5,6 +5,8 @@ package syscont
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +30,8 @@ const (
 	kubernetesContainerNameAnno  = "io.kubernetes.cri.container-name"
 	kubernetesSandboxUIDAnno     = "io.kubernetes.cri.sandbox-uid"
 	rootfsSpecialMountBase       = "/var/lib/sysbox/rootfs-special-volume"
+	persistentSpecialHandoffDir  = "/run/sysbox/rootfs-pvc-handoff"
+	persistentSpecialHandoffVer  = 1
 	persistentSpecialMetaVersion = 3
 	kubeletPodsDir               = "/var/lib/kubelet/pods"
 )
@@ -56,16 +60,27 @@ type persistentSpecialConfig struct {
 	meta        persistentSpecialMeta
 }
 
-// cfgPersistentSpecialMounts converts the admission-injected, hidden PVC mount
-// into explicit mounts for data that Sysbox otherwise stores in node-local
-// special volumes. This behavior is explicitly opt-in so existing containers
-// retain the legacy node-local special-volume behavior after a Sysbox upgrade.
-func cfgPersistentSpecialMounts(spec *specs.Spec) error {
-	return cfgPersistentSpecialMountsAt(spec, kubeletPodsDir)
+type persistentSpecialHandoff struct {
+	Version       int    `json:"version"`
+	SnapshotKey   string `json:"snapshotKey"`
+	PodUID        string `json:"podUID"`
+	ContainerName string `json:"containerName"`
+	VolumeName    string `json:"volumeName"`
+	PVCMountPath  string `json:"pvcMountPath"`
+}
+
+// cfgPersistentSpecialMounts converts a snapshotter handoff (or a legacy
+// admission-injected PVC mount) into explicit persistent special mounts.
+func cfgPersistentSpecialMounts(spec *specs.Spec, containerID string) error {
+	return cfgPersistentSpecialMountsWithHandoffAt(spec, kubeletPodsDir, persistentSpecialHandoffDir, containerID)
 }
 
 func cfgPersistentSpecialMountsAt(spec *specs.Spec, podsDir string) error {
-	config, enabled, err := resolvePersistentSpecialConfig(spec, podsDir)
+	return cfgPersistentSpecialMountsWithHandoffAt(spec, podsDir, "", "")
+}
+
+func cfgPersistentSpecialMountsWithHandoffAt(spec *specs.Spec, podsDir, handoffDir, containerID string) error {
+	config, enabled, err := resolvePersistentSpecialConfigWithHandoff(spec, podsDir, handoffDir, containerID)
 	if err != nil || !enabled {
 		return err
 	}
@@ -103,6 +118,10 @@ func cfgPersistentSpecialMountsAt(spec *specs.Spec, podsDir string) error {
 }
 
 func resolvePersistentSpecialConfig(spec *specs.Spec, podsDir string) (persistentSpecialConfig, bool, error) {
+	return resolvePersistentSpecialConfigWithHandoff(spec, podsDir, "", "")
+}
+
+func resolvePersistentSpecialConfigWithHandoff(spec *specs.Spec, podsDir, handoffDir, containerID string) (persistentSpecialConfig, bool, error) {
 	if spec.Annotations[persistentSpecialAnnotation] != "true" {
 		return persistentSpecialConfig{}, false, nil
 	}
@@ -164,13 +183,10 @@ func resolvePersistentSpecialConfig(spec *specs.Spec, podsDir string) (persisten
 			hidden = append(hidden, mount)
 		}
 	}
-	if len(hidden) == 0 && reservedMountCount == 0 {
-		return persistentSpecialConfig{}, false, nil
-	}
-	if len(hidden) != 1 {
+	if reservedMountCount > 0 && len(hidden) != 1 {
 		return persistentSpecialConfig{}, false, fmt.Errorf("container %q requires exactly one hidden PVC mount at %s; found %d", containerName, hiddenDest, len(hidden))
 	}
-	if hidden[0].Type != "bind" || !filepath.IsAbs(hidden[0].Source) {
+	if len(hidden) == 1 && (hidden[0].Type != "bind" || !filepath.IsAbs(hidden[0].Source)) {
 		return persistentSpecialConfig{}, false, fmt.Errorf("hidden PVC mount at %s is not an absolute bind mount", hiddenDest)
 	}
 	podUID := spec.Annotations[kubernetesSandboxUIDAnno]
@@ -180,9 +196,32 @@ func resolvePersistentSpecialConfig(spec *specs.Spec, podsDir string) (persisten
 	if filepath.Base(podUID) != podUID || podUID == "." || podUID == ".." {
 		return persistentSpecialConfig{}, false, fmt.Errorf("container %q Kubernetes sandbox UID annotation is unsafe", containerName)
 	}
-	pvcRoot, err := validatePVCMountSource(hidden[0].Source, podUID, podsDir)
+	var pvcRoot string
+	if len(hidden) == 1 {
+		pvcRoot, err = validatePVCMountSource(hidden[0].Source, podUID, podsDir)
+		if err != nil {
+			return persistentSpecialConfig{}, false, err
+		}
+	}
+	handoff, found, err := loadPersistentSpecialHandoff(handoffDir, containerID)
 	if err != nil {
 		return persistentSpecialConfig{}, false, err
+	}
+	if found {
+		if handoff.Version != persistentSpecialHandoffVer || handoff.SnapshotKey != containerID || handoff.PodUID != podUID || handoff.ContainerName != containerName || handoff.VolumeName != entry.VolumeName {
+			return persistentSpecialConfig{}, false, fmt.Errorf("persistent special handoff does not match the current container")
+		}
+		handoffRoot, err := validatePVCMountSource(handoff.PVCMountPath, podUID, podsDir)
+		if err != nil {
+			return persistentSpecialConfig{}, false, err
+		}
+		if pvcRoot != "" && pvcRoot != handoffRoot {
+			return persistentSpecialConfig{}, false, fmt.Errorf("persistent special handoff and hidden PVC mount disagree")
+		}
+		pvcRoot = handoffRoot
+	}
+	if pvcRoot == "" {
+		return persistentSpecialConfig{}, false, fmt.Errorf("container %q persistent special PVC source is unavailable", containerName)
 	}
 	lexicalLayerRoot := filepath.Join(pvcRoot, cleanPath)
 	if err := rejectPersistentSpecialSymlinks(pvcRoot, lexicalLayerRoot); err != nil {
@@ -213,6 +252,40 @@ func resolvePersistentSpecialConfig(spec *specs.Spec, podsDir string) (persisten
 		specialRoot: filepath.Join(layerRoot, "special"),
 		meta:        meta,
 	}, true, nil
+}
+
+func loadPersistentSpecialHandoff(root, containerID string) (persistentSpecialHandoff, bool, error) {
+	if root == "" || containerID == "" {
+		return persistentSpecialHandoff{}, false, nil
+	}
+	sum := sha256.Sum256([]byte(containerID))
+	path := filepath.Join(root, hex.EncodeToString(sum[:])+".json")
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return persistentSpecialHandoff{}, false, nil
+	}
+	if err != nil {
+		return persistentSpecialHandoff{}, false, fmt.Errorf("open persistent special handoff: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return persistentSpecialHandoff{}, false, fmt.Errorf("stat persistent special handoff: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return persistentSpecialHandoff{}, false, fmt.Errorf("persistent special handoff has unsafe permissions")
+	}
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	var handoff persistentSpecialHandoff
+	if err := decoder.Decode(&handoff); err != nil {
+		return persistentSpecialHandoff{}, false, fmt.Errorf("decode persistent special handoff: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return persistentSpecialHandoff{}, false, fmt.Errorf("decode persistent special handoff: trailing JSON data")
+	}
+	return handoff, true, nil
 }
 
 func decodeRootfsRwLayerEntries(raw string) ([]rootfsRwLayerEntry, error) {
