@@ -138,37 +138,40 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 		Destination: "/var/lib/kubelet",
 		Type:        "bind",
 	})
-	copyCount := 0
-	copyDir := func(source, destination string, uidMappings, gidMappings []specs.LinuxIDMapping) error {
-		copyCount++
-		if !reflect.DeepEqual(uidMappings, spec.Linux.UIDMappings) || !reflect.DeepEqual(gidMappings, spec.Linux.GIDMappings) {
-			t.Fatalf("copy mappings = %#v/%#v", uidMappings, gidMappings)
-		}
-		return os.WriteFile(filepath.Join(destination, "from-image"), []byte(source), 0o644)
+	if err := os.WriteFile(filepath.Join(spec.Root.Path, "var/lib/docker/from-image"), []byte("preloaded"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	config, enabled, err := resolvePersistentSpecialConfig(spec, podsDir)
 	if err != nil || !enabled {
 		t.Fatalf("resolve config: enabled=%v err=%v", enabled, err)
 	}
-	if err := initializePersistentSpecial(spec, config, copyDir); err != nil {
+	if err := initializePersistentUpperMounts(config); err != nil {
 		t.Fatal(err)
 	}
-	if copyCount != 7 {
-		t.Fatalf("copied %d image directories, want 7", copyCount)
-	}
-	for _, mapping := range config.meta.Mappings {
-		if _, err := os.Stat(filepath.Join(config.specialRoot, mapping.Name, "from-image")); err != nil {
+	for _, mapping := range config.mappings {
+		source, err := persistentUpperMountSource(config, mapping)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info, err := os.Stat(source); err != nil || !info.IsDir() {
 			t.Fatalf("mapping %s not initialized: %v", mapping.Name, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(config.specialRoot, "meta.json")); err != nil {
-		t.Fatalf("metadata was not written: %v", err)
+	dockerSource := filepath.Join(config.upperRoot, "var/lib/docker")
+	if _, err := os.Stat(filepath.Join(dockerSource, "from-image")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("image preload unexpectedly copied: %v", err)
 	}
-
-	if err := initializePersistentSpecial(spec, config, func(string, string, []specs.LinuxIDMapping, []specs.LinuxIDMapping) error {
-		return errors.New("copy must not run when metadata matches")
-	}); err != nil {
+	if err := os.WriteFile(filepath.Join(dockerSource, "persistent"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializePersistentUpperMounts(config); err != nil {
 		t.Fatalf("reuse failed: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(dockerSource, "persistent")); err != nil || string(data) != "data" {
+		t.Fatalf("persistent data = %q err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(config.layerRoot, "special")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("special directory err = %v, want not exist", err)
 	}
 
 	if err := cfgPersistentSpecialMountsAt(spec, podsDir); err != nil {
@@ -177,9 +180,10 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 	if len(spec.Mounts) != 7 {
 		t.Fatalf("got %d mounts, want 7: %#v", len(spec.Mounts), spec.Mounts)
 	}
-	for index, mapping := range config.meta.Mappings {
+	for index, mapping := range config.mappings {
 		mount := spec.Mounts[index]
-		if mount.Source != filepath.Join(pvcRoot, "containers/app/special", mapping.Name) ||
+		wantSource := filepath.Join(pvcRoot, "containers/app/upper", strings.TrimPrefix(mapping.Destination, "/"))
+		if mount.Source != wantSource ||
 			mount.Destination != mapping.Destination || mount.Type != "bind" ||
 			!reflect.DeepEqual(mount.Options, []string{"rbind", "rprivate"}) {
 			t.Fatalf("unexpected persistent mount: %#v", mount)
@@ -217,8 +221,8 @@ func TestCfgPersistentSpecialMountsUsesSnapshotterHandoffWithoutApplicationPVCMo
 		if strings.HasPrefix(mount.Destination, rootfsSpecialMountBase) {
 			t.Fatalf("handoff mount leaked into final spec: %#v", mount)
 		}
-		if !strings.HasPrefix(mount.Source, filepath.Join(pvcRoot, "containers/app/special")+string(filepath.Separator)) {
-			t.Fatalf("persistent mount source is outside PVC special directory: %#v", mount)
+		if !strings.HasPrefix(mount.Source, filepath.Join(pvcRoot, "containers/app/upper")+string(filepath.Separator)) {
+			t.Fatalf("persistent mount source is outside PVC upper directory: %#v", mount)
 		}
 	}
 }
@@ -368,123 +372,120 @@ func TestResolvePersistentSpecialConfigUsesCustomDestinations(t *testing.T) {
 		t.Fatalf("resolve config: enabled=%v err=%v", enabled, err)
 	}
 	want := map[string]string{"docker": "/docker-data", "k3s-agent": "/k3s-data/agent", "rke2": "/rke2-data"}
-	for _, mapping := range config.meta.Mappings {
+	for _, mapping := range config.mappings {
 		if destination, found := want[mapping.Name]; found && mapping.Destination != destination {
 			t.Fatalf("mapping %s destination = %q, want %q", mapping.Name, mapping.Destination, destination)
 		}
 		delete(want, mapping.Name)
 	}
 	if len(want) != 0 {
-		t.Fatalf("custom destinations not preserved: %#v", config.meta.Mappings)
+		t.Fatalf("custom destinations not preserved: %#v", config.mappings)
 	}
 }
 
-func TestInitializePersistentSpecialRejectsLegacyMetadata(t *testing.T) {
-	podsDir := t.TempDir()
-	spec, _ := persistentSpecialTestSpec(t, podsDir, "pod-uid", "app")
-	config, _, err := resolvePersistentSpecialConfig(spec, podsDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := initializePersistentSpecial(spec, config, func(string, string, []specs.LinuxIDMapping, []specs.LinuxIDMapping) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	legacy := []byte(`{"version":2,"mappings":[{"name":"docker","destination":"/var/lib/docker"}]}`)
-	if err := os.WriteFile(filepath.Join(config.specialRoot, "meta.json"), legacy, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := initializePersistentSpecial(spec, config, func(string, string, []specs.LinuxIDMapping, []specs.LinuxIDMapping) error { return nil }); err == nil || !strings.Contains(err.Error(), "does not match") {
-		t.Fatalf("legacy metadata error = %v", err)
-	}
-}
-
-func TestPersistentSpecialRsyncIDMapNormalizesHostIDs(t *testing.T) {
-	ids := map[uint32]struct{}{42: {}, 100000: {}, 100007: {}, 200003: {}}
-	mappings := []specs.LinuxIDMapping{
-		{ContainerID: 0, HostID: 100000, Size: 65536},
-		{ContainerID: 65536, HostID: 200000, Size: 1024},
-	}
-	got, err := persistentSpecialRsyncIDMap(ids, mappings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := "100000:0,100007:7,200003:65539"; got != want {
-		t.Fatalf("ID map = %q, want %q", got, want)
-	}
-}
-
-func TestPersistentSpecialRsyncIDMapKeepsContainerIDs(t *testing.T) {
-	ids := map[uint32]struct{}{0: {}, 7: {}, 65534: {}}
-	mappings := []specs.LinuxIDMapping{{ContainerID: 0, HostID: 100000, Size: 65536}}
-	got, err := persistentSpecialRsyncIDMap(ids, mappings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "" {
-		t.Fatalf("ID map = %q, want empty", got)
-	}
-}
-
-func TestPersistentSpecialRsyncIDMapsScansSource(t *testing.T) {
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "file"), []byte("data"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("file", filepath.Join(root, "link")); err != nil {
-		t.Fatal(err)
-	}
-	mapping := []specs.LinuxIDMapping{{ContainerID: 123, HostID: 0, Size: 1}}
-	uidMap, gidMap, err := persistentSpecialRsyncIDMaps(root, mapping, mapping)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if uidMap != "0:123" || gidMap != "0:123" {
-		t.Fatalf("ID maps = %q/%q, want 0:123/0:123", uidMap, gidMap)
-	}
-}
-
-func TestPersistentSpecialContainerIDRejectsInvalidMappings(t *testing.T) {
+func TestInitializePersistentUpperMountsRejectsInvalidPaths(t *testing.T) {
 	tests := []struct {
-		name    string
-		mapping specs.LinuxIDMapping
+		name   string
+		mutate func(t *testing.T, upperRoot, dockerPath string)
 	}{
-		{name: "zero size", mapping: specs.LinuxIDMapping{HostID: 100000}},
-		{name: "host overflow", mapping: specs.LinuxIDMapping{HostID: ^uint32(0), Size: 2}},
-		{name: "container overflow", mapping: specs.LinuxIDMapping{ContainerID: ^uint32(0), HostID: 100000, Size: 2}},
+		{
+			name: "symlink",
+			mutate: func(t *testing.T, _ string, dockerPath string) {
+				if err := os.Remove(dockerPath); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(t.TempDir(), dockerPath); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "parent symlink",
+			mutate: func(t *testing.T, upperRoot, _ string) {
+				varLib := filepath.Join(upperRoot, "var/lib")
+				if err := os.RemoveAll(varLib); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(t.TempDir(), varLib); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "regular file",
+			mutate: func(t *testing.T, _ string, dockerPath string) {
+				if err := os.Remove(dockerPath); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(dockerPath, []byte("invalid"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, _, err := persistentSpecialContainerID(test.mapping.HostID, []specs.LinuxIDMapping{test.mapping}); err == nil {
-				t.Fatal("expected invalid mapping error")
+			podsDir := t.TempDir()
+			spec, _ := persistentSpecialTestSpec(t, podsDir, "pod-uid", "app")
+			config, _, err := resolvePersistentSpecialConfig(spec, podsDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := initializePersistentUpperMounts(config); err != nil {
+				t.Fatal(err)
+			}
+			dockerPath := filepath.Join(config.upperRoot, "var/lib/docker")
+			test.mutate(t, config.upperRoot, dockerPath)
+			if err := initializePersistentUpperMounts(config); err == nil {
+				t.Fatal("expected invalid upper path error")
 			}
 		})
 	}
 }
 
-func TestInitializePersistentSpecialFailsClosedAndCleansStaging(t *testing.T) {
+func TestInitializePersistentUpperMountsUsesChangedDestination(t *testing.T) {
 	podsDir := t.TempDir()
 	spec, _ := persistentSpecialTestSpec(t, podsDir, "pod-uid", "app")
 	config, _, err := resolvePersistentSpecialConfig(spec, podsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := initializePersistentSpecial(spec, config, func(string, string, []specs.LinuxIDMapping, []specs.LinuxIDMapping) error {
-		return errors.New("copy failed")
-	}); err == nil {
-		t.Fatal("expected initialization failure")
-	}
-	if _, err := os.Stat(config.specialRoot); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("special directory exists after failed initialization: %v", err)
-	}
-	staging, err := filepath.Glob(filepath.Join(config.layerRoot, ".special.staging-*"))
-	if err != nil || len(staging) != 0 {
-		t.Fatalf("staging directory was not cleaned: %#v err=%v", staging, err)
-	}
-
-	if err := os.Mkdir(config.specialRoot, 0o755); err != nil {
+	if err := initializePersistentUpperMounts(config); err != nil {
 		t.Fatal(err)
 	}
-	if err := initializePersistentSpecial(spec, config, func(string, string, []specs.LinuxIDMapping, []specs.LinuxIDMapping) error { return nil }); err == nil || !strings.Contains(err.Error(), "without valid metadata") {
-		t.Fatalf("unmarked directory error = %v", err)
+	if err := os.MkdirAll(filepath.Join(spec.Root.Path, "etc/docker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(spec.Root.Path, "etc/docker/daemon.json"), []byte("{\n  \"data-root\": \"/docker-data\"\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed, _, err := resolvePersistentSpecialConfig(spec, podsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initializePersistentUpperMounts(changed); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(filepath.Join(changed.upperRoot, "docker-data")); err != nil || !info.IsDir() {
+		t.Fatalf("custom docker upper path not created: %v", err)
+	}
+	for _, mapping := range changed.mappings {
+		if mapping.Name == "docker" && mapping.Destination != "/docker-data" {
+			t.Fatalf("docker destination = %q", mapping.Destination)
+		}
+	}
+}
+
+func TestResolvePersistentSpecialConfigRejectsOverlappingDestinations(t *testing.T) {
+	podsDir := t.TempDir()
+	spec, _ := persistentSpecialTestSpec(t, podsDir, "pod-uid", "app")
+	if err := os.MkdirAll(filepath.Join(spec.Root.Path, "etc/docker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(spec.Root.Path, "etc/docker/daemon.json"), []byte("{\n  \"data-root\": \"/var/lib\"\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := resolvePersistentSpecialConfig(spec, podsDir); err == nil || !strings.Contains(err.Error(), "overlap") {
+		t.Fatalf("overlap error = %v", err)
 	}
 }
