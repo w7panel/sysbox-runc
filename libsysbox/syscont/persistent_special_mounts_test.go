@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 )
 
 func writePersistentSpecialHandoff(t *testing.T, root, containerID string, handoff persistentSpecialHandoff) {
@@ -44,7 +45,7 @@ func persistentSpecialTestSpec(t *testing.T, podsDir, podUID, layerPath string) 
 		"var/lib/docker",
 		"var/lib/kubelet",
 		"var/lib/k0s",
-		"var/lib/rancher/k3s/agent",
+		"var/lib/rancher/k3s",
 		"var/lib/rancher/rke2",
 		"var/lib/buildkit",
 		"var/lib/containerd/io.containerd.snapshotter.v1.overlayfs",
@@ -53,7 +54,7 @@ func persistentSpecialTestSpec(t *testing.T, podsDir, podUID, layerPath string) 
 			t.Fatal(err)
 		}
 	}
-	raw := `[{"name":"app","volumeName":"rootfs","path":"` + layerPath + `"}]`
+	raw := `[{"name":"app","volumeName":"rootfs","path":"` + layerPath + `","persistentSpecialMounts":true}]`
 	return &specs.Spec{
 		Root: &specs.Root{Path: rootfs},
 		Linux: &specs.Linux{
@@ -62,7 +63,6 @@ func persistentSpecialTestSpec(t *testing.T, podsDir, podUID, layerPath string) 
 		},
 		Annotations: map[string]string{
 			rootfsRwLayerAnnotation:     raw,
-			persistentSpecialAnnotation: "true",
 			kubernetesContainerNameAnno: "app",
 			kubernetesSandboxUIDAnno:    podUID,
 		},
@@ -77,7 +77,7 @@ func persistentSpecialTestSpec(t *testing.T, podsDir, podUID, layerPath string) 
 func TestCfgPersistentSpecialMountsRequiresExplicitOptIn(t *testing.T) {
 	podsDir := t.TempDir()
 	spec, _ := persistentSpecialTestSpec(t, podsDir, "pod-uid", "containers/app")
-	delete(spec.Annotations, persistentSpecialAnnotation)
+	spec.Annotations[rootfsRwLayerAnnotation] = `[{"name":"app","volumeName":"rootfs","path":"containers/app"}]`
 	original := append([]specs.Mount(nil), spec.Mounts...)
 
 	if err := cfgPersistentSpecialMountsAt(spec, podsDir); err != nil {
@@ -87,12 +87,56 @@ func TestCfgPersistentSpecialMountsRequiresExplicitOptIn(t *testing.T) {
 		t.Fatalf("mounts changed without explicit opt-in: %#v", spec.Mounts)
 	}
 
-	spec.Annotations[persistentSpecialAnnotation] = "false"
+	spec.Annotations[rootfsRwLayerAnnotation] = `[{"name":"app","volumeName":"rootfs","path":"containers/app","persistentSpecialMounts":false}]`
 	if err := cfgPersistentSpecialMountsAt(spec, podsDir); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(spec.Mounts, original) {
 		t.Fatalf("mounts changed with opt-in disabled: %#v", spec.Mounts)
+	}
+}
+
+func TestCfgPersistentSpecialMountsUsesCustomSpecialPath(t *testing.T) {
+	podsDir := t.TempDir()
+	spec, pvcRoot := persistentSpecialTestSpec(t, podsDir, "pod-uid", "containers/app")
+	spec.Annotations[rootfsRwLayerAnnotation] = `[{"name":"app","volumeName":"rootfs","path":"containers/app","persistentSpecialMounts":true,"specialPath":["/srv/custom"]}]`
+	if err := os.MkdirAll(filepath.Join(spec.Root.Path, "srv/custom"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(spec.Root.Path, "srv/custom/from-image"), []byte("seed"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cfgPersistentSpecialMountsAt(spec, podsDir); err != nil {
+		t.Fatal(err)
+	}
+	var custom *specs.Mount
+	for i := range spec.Mounts {
+		if spec.Mounts[i].Destination == "/srv/custom" {
+			custom = &spec.Mounts[i]
+			break
+		}
+	}
+	if custom == nil {
+		t.Fatal("custom special mount was not generated")
+	}
+	wantSource := filepath.Join(pvcRoot, "containers/app/special/srv/custom")
+	if custom.Source != wantSource {
+		t.Fatalf("custom source = %q, want %q", custom.Source, wantSource)
+	}
+	if data, err := os.ReadFile(filepath.Join(wantSource, "from-image")); err != nil || string(data) != "seed" {
+		t.Fatalf("custom image seed = %q, err=%v", data, err)
+	}
+}
+
+func TestCfgPersistentSpecialMountsRejectsCustomPathWithoutOptIn(t *testing.T) {
+	podsDir := t.TempDir()
+	spec, _ := persistentSpecialTestSpec(t, podsDir, "pod-uid", "containers/app")
+	spec.Annotations[rootfsRwLayerAnnotation] = `[{"name":"app","volumeName":"rootfs","path":"containers/app","specialPath":["/srv/custom"]}]`
+
+	err := cfgPersistentSpecialMountsAt(spec, podsDir)
+	if err == nil || !strings.Contains(err.Error(), "specialPath requires persistentSpecialMounts") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -107,8 +151,7 @@ func TestCfgPersistentSpecialMountsDoesNothingWithoutMatchingEntry(t *testing.T)
 	}
 
 	spec.Annotations = map[string]string{
-		rootfsRwLayerAnnotation:     `[{"name":"other","volumeName":"rootfs","path":"other"}]`,
-		persistentSpecialAnnotation: "true",
+		rootfsRwLayerAnnotation:     `[{"name":"other","volumeName":"rootfs","path":"other","persistentSpecialMounts":true}]`,
 		kubernetesContainerNameAnno: "app",
 	}
 	if err := cfgPersistentSpecialMountsAt(spec, t.TempDir()); err != nil {
@@ -118,8 +161,7 @@ func TestCfgPersistentSpecialMountsDoesNothingWithoutMatchingEntry(t *testing.T)
 
 func TestCfgPersistentSpecialMountsSkipsPodSandbox(t *testing.T) {
 	spec := &specs.Spec{Annotations: map[string]string{
-		rootfsRwLayerAnnotation:     `[{"name":"app","volumeName":"rootfs","path":"app"}]`,
-		persistentSpecialAnnotation: "true",
+		rootfsRwLayerAnnotation: `[{"name":"app","volumeName":"rootfs","path":"app","persistentSpecialMounts":true}]`,
 	}}
 	if err := cfgPersistentSpecialMountsAt(spec, t.TempDir()); err != nil {
 		t.Fatalf("sandbox spec must be ignored: %v", err)
@@ -145,11 +187,11 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 	if err != nil || !enabled {
 		t.Fatalf("resolve config: enabled=%v err=%v", enabled, err)
 	}
-	if err := initializePersistentUpperMounts(spec, config); err != nil {
+	if err := initializePersistentSpecialMounts(spec, config); err != nil {
 		t.Fatal(err)
 	}
 	for _, mapping := range config.mappings {
-		source, err := persistentUpperMountSource(config, mapping)
+		source, err := persistentSpecialMountSource(config, mapping)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -157,27 +199,56 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 			t.Fatalf("mapping %s not initialized: %v", mapping.Name, err)
 		}
 	}
-	dockerSource := filepath.Join(config.upperRoot, "var/lib/docker")
+	dockerSource := filepath.Join(config.specialRoot, "var/lib/docker")
 	if data, err := os.ReadFile(filepath.Join(dockerSource, "from-image")); err != nil || string(data) != "preloaded" {
 		t.Fatalf("image preload = %q err=%v", data, err)
 	}
 	if err := os.WriteFile(filepath.Join(dockerSource, "persistent"), []byte("data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	var ownershipBefore unix.Stat_t
+	if err := unix.Lstat(filepath.Join(dockerSource, "persistent"), &ownershipBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(filepath.Join(dockerSource, "persistent"), "user.sysbox-test", []byte("kept"), 0); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(spec.Root.Path, "var/lib/docker/after-first"), []byte("new-image-data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := initializePersistentUpperMounts(spec, config); err != nil {
+	// Simulate another Pod reusing the PVC with a different user namespace.
+	// Existing PVC state must not be re-seeded or ownership-shifted.
+	spec.Linux.UIDMappings = []specs.LinuxIDMapping{{ContainerID: 0, HostID: 300000, Size: 65536}}
+	spec.Linux.GIDMappings = []specs.LinuxIDMapping{{ContainerID: 0, HostID: 400000, Size: 65536}}
+	if err := initializePersistentSpecialMounts(spec, config); err != nil {
 		t.Fatalf("reuse failed: %v", err)
 	}
 	if data, err := os.ReadFile(filepath.Join(dockerSource, "persistent")); err != nil || string(data) != "data" {
 		t.Fatalf("persistent data = %q err=%v", data, err)
 	}
+	var persistentStat unix.Stat_t
+	if err := unix.Lstat(filepath.Join(dockerSource, "persistent"), &persistentStat); err != nil {
+		t.Fatal(err)
+	}
+	if persistentStat.Uid != ownershipBefore.Uid || persistentStat.Gid != ownershipBefore.Gid {
+		t.Fatalf("persistent ownership changed from %d:%d to %d:%d", ownershipBefore.Uid, ownershipBefore.Gid, persistentStat.Uid, persistentStat.Gid)
+	}
+	xattr := make([]byte, 16)
+	size, err := unix.Getxattr(filepath.Join(dockerSource, "persistent"), "user.sysbox-test", xattr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(xattr[:size]) != "kept" {
+		t.Fatalf("persistent xattr = %q", xattr[:size])
+	}
 	if _, err := os.Stat(filepath.Join(dockerSource, "after-first")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("existing PVC directory was re-seeded: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(config.layerRoot, "special")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("special directory err = %v, want not exist", err)
+	if info, err := os.Stat(filepath.Join(config.layerRoot, "special")); err != nil || !info.IsDir() {
+		t.Fatalf("special directory err = %v, want directory", err)
+	}
+	if _, err := os.Stat(filepath.Join(config.layerRoot, "upper", ".sysbox-special")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy special directory err = %v, want not exist", err)
 	}
 
 	if err := cfgPersistentSpecialMountsAt(spec, podsDir); err != nil {
@@ -188,7 +259,7 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 	}
 	for index, mapping := range config.mappings {
 		mount := spec.Mounts[index]
-		wantSource := filepath.Join(pvcRoot, "containers/app/upper", strings.TrimPrefix(mapping.Destination, "/"))
+		wantSource := filepath.Join(pvcRoot, "containers/app/special", strings.TrimPrefix(mapping.Destination, "/"))
 		if mount.Source != wantSource ||
 			mount.Destination != mapping.Destination || mount.Type != "bind" ||
 			!reflect.DeepEqual(mount.Options, []string{"rbind", "rprivate"}) {
@@ -202,19 +273,32 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 	}
 }
 
-func TestInitializePersistentUpperMountsCreatesEmptyDirectoryForMissingImagePath(t *testing.T) {
-	rootfs := t.TempDir()
-	upperRoot := filepath.Join(t.TempDir(), "upper")
-	spec := &specs.Spec{Root: &specs.Root{Path: rootfs}}
-	config := persistentSpecialConfig{
-		layerRoot: filepath.Dir(upperRoot),
-		upperRoot: upperRoot,
-		mappings:  []persistentSpecialMapping{{Name: "missing", Destination: "/var/lib/missing"}},
-	}
-	if err := initializePersistentUpperMounts(spec, config); err != nil {
+func TestPersistentSpecialRsyncIDMapStoresCanonicalContainerIDs(t *testing.T) {
+	ids := map[uint32]struct{}{0: {}, 100000: {}, 100123: {}}
+	mappings := []specs.LinuxIDMapping{{ContainerID: 0, HostID: 100000, Size: 65536}}
+
+	got, err := persistentSpecialRsyncIDMap(ids, mappings)
+	if err != nil {
 		t.Fatal(err)
 	}
-	destination := filepath.Join(upperRoot, "var/lib/missing")
+	if got != "100000:0,100123:123" {
+		t.Fatalf("ID map = %q, want canonical container IDs", got)
+	}
+}
+
+func TestInitializePersistentSpecialMountsCreatesEmptyDirectoryForMissingImagePath(t *testing.T) {
+	rootfs := t.TempDir()
+	specialRoot := filepath.Join(t.TempDir(), "special")
+	spec := &specs.Spec{Root: &specs.Root{Path: rootfs}}
+	config := persistentSpecialConfig{
+		layerRoot:   filepath.Dir(specialRoot),
+		specialRoot: specialRoot,
+		mappings:    []persistentSpecialMapping{{Name: "missing", Destination: "/var/lib/missing"}},
+	}
+	if err := initializePersistentSpecialMounts(spec, config); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(specialRoot, "var/lib/missing")
 	entries, err := os.ReadDir(destination)
 	if err != nil {
 		t.Fatal(err)
@@ -224,7 +308,7 @@ func TestInitializePersistentUpperMountsCreatesEmptyDirectoryForMissingImagePath
 	}
 }
 
-func TestInitializePersistentUpperMountsRejectsInvalidImageSource(t *testing.T) {
+func TestInitializePersistentSpecialMountsRejectsInvalidImageSource(t *testing.T) {
 	tests := []struct {
 		name   string
 		create func(t *testing.T, path string)
@@ -256,17 +340,17 @@ func TestInitializePersistentUpperMountsRejectsInvalidImageSource(t *testing.T) 
 				t.Fatal(err)
 			}
 			test.create(t, source)
-			upperRoot := filepath.Join(t.TempDir(), "upper")
+			specialRoot := filepath.Join(t.TempDir(), "special")
 			spec := &specs.Spec{Root: &specs.Root{Path: rootfs}}
 			config := persistentSpecialConfig{
-				layerRoot: filepath.Dir(upperRoot),
-				upperRoot: upperRoot,
-				mappings:  []persistentSpecialMapping{{Name: "docker", Destination: "/var/lib/docker"}},
+				layerRoot:   filepath.Dir(specialRoot),
+				specialRoot: specialRoot,
+				mappings:    []persistentSpecialMapping{{Name: "docker", Destination: "/var/lib/docker"}},
 			}
-			if err := initializePersistentUpperMounts(spec, config); err == nil {
+			if err := initializePersistentSpecialMounts(spec, config); err == nil {
 				t.Fatal("expected invalid image source error")
 			}
-			if _, err := os.Stat(filepath.Join(upperRoot, "var/lib/docker")); !errors.Is(err, os.ErrNotExist) {
+			if _, err := os.Stat(filepath.Join(specialRoot, "var/lib/docker")); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("invalid image source published a target: %v", err)
 			}
 		})
@@ -298,8 +382,8 @@ func TestCfgPersistentSpecialMountsUsesSnapshotterHandoffWithoutApplicationPVCMo
 		if strings.HasPrefix(mount.Destination, rootfsSpecialMountBase) {
 			t.Fatalf("handoff mount leaked into final spec: %#v", mount)
 		}
-		if !strings.HasPrefix(mount.Source, filepath.Join(pvcRoot, "containers/app/upper")+string(filepath.Separator)) {
-			t.Fatalf("persistent mount source is outside PVC upper directory: %#v", mount)
+		if !strings.HasPrefix(mount.Source, filepath.Join(pvcRoot, "containers/app/special")+string(filepath.Separator)) {
+			t.Fatalf("persistent mount source is outside PVC special directory: %#v", mount)
 		}
 	}
 }
@@ -393,7 +477,7 @@ func TestResolvePersistentSpecialConfigRejectsInvalidContract(t *testing.T) {
 		{
 			name: "escaping layer path",
 			mutate: func(spec *specs.Spec) {
-				spec.Annotations[rootfsRwLayerAnnotation] = `[{"name":"app","volumeName":"rootfs","path":"../escape"}]`
+				spec.Annotations[rootfsRwLayerAnnotation] = `[{"name":"app","volumeName":"rootfs","path":"../escape","persistentSpecialMounts":true}]`
 			},
 			want: "must not escape",
 		},
@@ -448,7 +532,7 @@ func TestResolvePersistentSpecialConfigUsesCustomDestinations(t *testing.T) {
 	if err != nil || !enabled {
 		t.Fatalf("resolve config: enabled=%v err=%v", enabled, err)
 	}
-	want := map[string]string{"docker": "/docker-data", "k3s-agent": "/k3s-data/agent", "rke2": "/rke2-data"}
+	want := map[string]string{"docker": "/docker-data", "k3s": "/k3s-data", "rke2": "/rke2-data"}
 	for _, mapping := range config.mappings {
 		if destination, found := want[mapping.Name]; found && mapping.Destination != destination {
 			t.Fatalf("mapping %s destination = %q, want %q", mapping.Name, mapping.Destination, destination)
@@ -460,10 +544,10 @@ func TestResolvePersistentSpecialConfigUsesCustomDestinations(t *testing.T) {
 	}
 }
 
-func TestInitializePersistentUpperMountsRejectsInvalidPaths(t *testing.T) {
+func TestInitializePersistentSpecialMountsRejectsInvalidPaths(t *testing.T) {
 	tests := []struct {
 		name   string
-		mutate func(t *testing.T, upperRoot, dockerPath string)
+		mutate func(t *testing.T, specialRoot, dockerPath string)
 	}{
 		{
 			name: "symlink",
@@ -478,8 +562,8 @@ func TestInitializePersistentUpperMountsRejectsInvalidPaths(t *testing.T) {
 		},
 		{
 			name: "parent symlink",
-			mutate: func(t *testing.T, upperRoot, _ string) {
-				varLib := filepath.Join(upperRoot, "var/lib")
+			mutate: func(t *testing.T, specialRoot, _ string) {
+				varLib := filepath.Join(specialRoot, "var/lib")
 				if err := os.RemoveAll(varLib); err != nil {
 					t.Fatal(err)
 				}
@@ -508,26 +592,26 @@ func TestInitializePersistentUpperMountsRejectsInvalidPaths(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := initializePersistentUpperMounts(spec, config); err != nil {
+			if err := initializePersistentSpecialMounts(spec, config); err != nil {
 				t.Fatal(err)
 			}
-			dockerPath := filepath.Join(config.upperRoot, "var/lib/docker")
-			test.mutate(t, config.upperRoot, dockerPath)
-			if err := initializePersistentUpperMounts(spec, config); err == nil {
-				t.Fatal("expected invalid upper path error")
+			dockerPath := filepath.Join(config.specialRoot, "var/lib/docker")
+			test.mutate(t, config.specialRoot, dockerPath)
+			if err := initializePersistentSpecialMounts(spec, config); err == nil {
+				t.Fatal("expected invalid special path error")
 			}
 		})
 	}
 }
 
-func TestInitializePersistentUpperMountsUsesChangedDestination(t *testing.T) {
+func TestInitializePersistentSpecialMountsUsesChangedDestination(t *testing.T) {
 	podsDir := t.TempDir()
 	spec, _ := persistentSpecialTestSpec(t, podsDir, "pod-uid", "app")
 	config, _, err := resolvePersistentSpecialConfig(spec, podsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := initializePersistentUpperMounts(spec, config); err != nil {
+	if err := initializePersistentSpecialMounts(spec, config); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(spec.Root.Path, "etc/docker"), 0o755); err != nil {
@@ -540,11 +624,11 @@ func TestInitializePersistentUpperMountsUsesChangedDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := initializePersistentUpperMounts(spec, changed); err != nil {
+	if err := initializePersistentSpecialMounts(spec, changed); err != nil {
 		t.Fatal(err)
 	}
-	if info, err := os.Stat(filepath.Join(changed.upperRoot, "docker-data")); err != nil || !info.IsDir() {
-		t.Fatalf("custom docker upper path not created: %v", err)
+	if info, err := os.Stat(filepath.Join(changed.specialRoot, "docker-data")); err != nil || !info.IsDir() {
+		t.Fatalf("custom docker special path not created: %v", err)
 	}
 	for _, mapping := range changed.mappings {
 		if mapping.Name == "docker" && mapping.Destination != "/docker-data" {

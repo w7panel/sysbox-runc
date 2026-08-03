@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	ipcLib "github.com/nestybox/sysbox-ipc/sysboxMgrLib"
+	sh "github.com/nestybox/sysbox-libs/idShiftUtils"
 	utils "github.com/nestybox/sysbox-libs/utils"
 	"github.com/opencontainers/runc/libsysbox/sysbox"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -105,12 +106,12 @@ func TestCfgNamespacesAddsDefaultTimeOffsets(t *testing.T) {
 
 func TestGetSpecialDirs(t *testing.T) {
 	want := map[string]ipcLib.MntKind{
-		"/var/lib/docker":            ipcLib.MntVarLibDocker,
-		"/var/lib/kubelet":           ipcLib.MntVarLibKubelet,
-		"/var/lib/k0s":               ipcLib.MntVarLibK0s,
-		"/var/lib/rancher/k3s/agent": ipcLib.MntVarLibRancherK3s,
-		"/var/lib/rancher/rke2":      ipcLib.MntVarLibRancherRke2,
-		"/var/lib/buildkit":          ipcLib.MntVarLibBuildkit,
+		"/var/lib/docker":       ipcLib.MntVarLibDocker,
+		"/var/lib/kubelet":      ipcLib.MntVarLibKubelet,
+		"/var/lib/k0s":          ipcLib.MntVarLibK0s,
+		"/var/lib/rancher/k3s":  ipcLib.MntVarLibRancherK3s,
+		"/var/lib/rancher/rke2": ipcLib.MntVarLibRancherRke2,
+		"/var/lib/buildkit":     ipcLib.MntVarLibBuildkit,
 		"/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs": ipcLib.MntVarLibContainerdOvfs,
 	}
 	spec := &specs.Spec{Root: &specs.Root{Path: t.TempDir()}}
@@ -144,7 +145,7 @@ func TestGetSpecialDirsKeepsCustomDockerDataRoot(t *testing.T) {
 	}
 }
 
-func TestGetSpecialDirsUsesCustomK3sAgentDir(t *testing.T) {
+func TestGetSpecialDirsUsesCustomK3sDataDir(t *testing.T) {
 	rootfs := t.TempDir()
 	k3sConfigDir := filepath.Join(rootfs, "etc/rancher/k3s")
 	if err := os.MkdirAll(k3sConfigDir, 0755); err != nil {
@@ -159,11 +160,15 @@ func TestGetSpecialDirsUsesCustomK3sAgentDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getSpecialDirs() error = %v", err)
 	}
-	if kind, found := dirs["/k3s-data/agent"]; !found || kind != ipcLib.MntVarLibRancherK3s {
-		t.Fatalf("custom K3s agent directory must be special, got kind=%v found=%v", kind, found)
+	if kind, found := dirs["/k3s-data"]; !found || kind != ipcLib.MntVarLibRancherK3s {
+		t.Fatalf("custom K3s data directory must be special, got kind=%v found=%v", kind, found)
 	}
-	if _, found := dirs["/k3s-data"]; found {
-		t.Fatal("full custom K3s data directory must not be special")
+}
+
+func TestValidatePersistentSpecialIDMapMountFailsWithoutIDMapMode(t *testing.T) {
+	err := validatePersistentSpecialIDMapMount(sh.Shiftfs, specs.Mount{Source: t.TempDir(), Destination: "/srv/custom"})
+	if err == nil {
+		t.Fatal("persistent custom special path must fail without idmapped mount mode")
 	}
 }
 

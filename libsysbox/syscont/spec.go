@@ -31,6 +31,7 @@ import (
 	mapset "github.com/deckarep/golang-set/v2"
 	ipcLib "github.com/nestybox/sysbox-ipc/sysboxMgrLib"
 	"github.com/nestybox/sysbox-libs/capability"
+	"github.com/nestybox/sysbox-libs/idMap"
 	sh "github.com/nestybox/sysbox-libs/idShiftUtils"
 	utils "github.com/nestybox/sysbox-libs/utils"
 	"github.com/opencontainers/runc/libsysbox/sysbox"
@@ -1008,7 +1009,7 @@ func getSpecialDirInfos(spec *specs.Spec) ([]specialDirInfo, error) {
 		{name: "docker", destination: innerDockerDataRoot, kind: ipcLib.MntVarLibDocker},
 		{name: "kubelet", destination: "/var/lib/kubelet", kind: ipcLib.MntVarLibKubelet},
 		{name: "k0s", destination: "/var/lib/k0s", kind: ipcLib.MntVarLibK0s},
-		{name: "k3s-agent", destination: filepath.Join(innerK3sDataDir, "agent"), kind: ipcLib.MntVarLibRancherK3s},
+		{name: "k3s", destination: innerK3sDataDir, kind: ipcLib.MntVarLibRancherK3s},
 		{name: "rke2", destination: innerRke2DataDir, kind: ipcLib.MntVarLibRancherRke2},
 		{name: "buildkit", destination: "/var/lib/buildkit", kind: ipcLib.MntVarLibBuildkit},
 		{name: "containerd-overlay", destination: "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs", kind: ipcLib.MntVarLibContainerdOvfs},
@@ -1063,7 +1064,8 @@ func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
 	rootfsUidShiftType := sysbox.RootfsUidShiftType
 	mgr := sysbox.Mgr
 
-	if err := cfgPersistentSpecialMounts(spec, sysbox.Id); err != nil {
+	persistentSpecialMounts, err := cfgPersistentSpecialMountsTracked(spec, kubeletPodsDir, persistentSpecialHandoffDir, sysbox.Id)
+	if err != nil {
 		return err
 	}
 
@@ -1083,6 +1085,16 @@ func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
 	for i := len(spec.Mounts) - 1; i >= 0; i-- {
 		m := spec.Mounts[i]
 		_, isSpecialDir := specialDirMap[m.Destination]
+
+		if m.Type == "bind" {
+			if source, persistent := persistentSpecialMounts[filepath.Clean(m.Destination)]; persistent && filepath.Clean(m.Source) == filepath.Clean(source) {
+				if err := validatePersistentSpecialIDMapMount(sysbox.BindMntUidShiftType, m); err != nil {
+					return err
+				}
+				delete(specialDirMap, m.Destination)
+				continue
+			}
+		}
 
 		if m.Type == "bind" && isSpecialDir {
 			info := ipcLib.MountPrepInfo{
@@ -1149,6 +1161,20 @@ func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
 
 	spec.Mounts = append(spec.Mounts, mounts...)
 
+	return nil
+}
+
+func validatePersistentSpecialIDMapMount(shiftType sh.IDShiftType, mount specs.Mount) error {
+	if shiftType != sh.IDMappedMount && shiftType != sh.IDMappedMountOrShiftfs {
+		return fmt.Errorf("persistent special mount %s requires idmapped mounts", mount.Destination)
+	}
+	supported, err := idMap.IDMapMountSupportedOnPath(mount.Source)
+	if err != nil {
+		return fmt.Errorf("check idmapped mount support for persistent special mount %s: %w", mount.Destination, err)
+	}
+	if !supported {
+		return fmt.Errorf("persistent special mount %s does not support idmapped mounts", mount.Destination)
+	}
 	return nil
 }
 

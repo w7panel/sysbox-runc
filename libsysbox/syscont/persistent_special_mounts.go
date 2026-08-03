@@ -24,7 +24,6 @@ import (
 
 const (
 	rootfsRwLayerAnnotation     = "sysbox/rootfs-rw-layer"
-	persistentSpecialAnnotation = "sysbox/persistent-special-mounts"
 	kubernetesContainerNameAnno = "io.kubernetes.cri.container-name"
 	kubernetesSandboxUIDAnno    = "io.kubernetes.cri.sandbox-uid"
 	rootfsSpecialMountBase      = "/var/lib/sysbox/rootfs-special-volume"
@@ -34,9 +33,11 @@ const (
 )
 
 type rootfsRwLayerEntry struct {
-	Name       string `json:"name"`
-	VolumeName string `json:"volumeName"`
-	Path       string `json:"path"`
+	Name                    string   `json:"name"`
+	VolumeName              string   `json:"volumeName"`
+	Path                    string   `json:"path"`
+	PersistentSpecialMounts bool     `json:"persistentSpecialMounts,omitempty"`
+	SpecialPath             []string `json:"specialPath,omitempty"`
 }
 
 type persistentSpecialMapping struct {
@@ -45,11 +46,11 @@ type persistentSpecialMapping struct {
 }
 
 type persistentSpecialConfig struct {
-	entry     rootfsRwLayerEntry
-	pvcRoot   string
-	layerRoot string
-	upperRoot string
-	mappings  []persistentSpecialMapping
+	entry       rootfsRwLayerEntry
+	pvcRoot     string
+	layerRoot   string
+	specialRoot string
+	mappings    []persistentSpecialMapping
 }
 
 type persistentSpecialHandoff struct {
@@ -64,21 +65,28 @@ type persistentSpecialHandoff struct {
 // cfgPersistentSpecialMounts converts a snapshotter handoff (or a legacy
 // admission-injected PVC mount) into explicit persistent special mounts.
 func cfgPersistentSpecialMounts(spec *specs.Spec, containerID string) error {
-	return cfgPersistentSpecialMountsWithHandoffAt(spec, kubeletPodsDir, persistentSpecialHandoffDir, containerID)
+	_, err := cfgPersistentSpecialMountsTracked(spec, kubeletPodsDir, persistentSpecialHandoffDir, containerID)
+	return err
 }
 
 func cfgPersistentSpecialMountsAt(spec *specs.Spec, podsDir string) error {
-	return cfgPersistentSpecialMountsWithHandoffAt(spec, podsDir, "", "")
+	_, err := cfgPersistentSpecialMountsTracked(spec, podsDir, "", "")
+	return err
 }
 
 func cfgPersistentSpecialMountsWithHandoffAt(spec *specs.Spec, podsDir, handoffDir, containerID string) error {
+	_, err := cfgPersistentSpecialMountsTracked(spec, podsDir, handoffDir, containerID)
+	return err
+}
+
+func cfgPersistentSpecialMountsTracked(spec *specs.Spec, podsDir, handoffDir, containerID string) (map[string]string, error) {
 	config, enabled, err := resolvePersistentSpecialConfigWithHandoff(spec, podsDir, handoffDir, containerID)
 	if err != nil || !enabled {
-		return err
+		return nil, err
 	}
 
-	if err := initializePersistentUpperMounts(spec, config); err != nil {
-		return err
+	if err := initializePersistentSpecialMounts(spec, config); err != nil {
+		return nil, err
 	}
 
 	hiddenDest := filepath.Join(rootfsSpecialMountBase, config.entry.VolumeName)
@@ -98,9 +106,9 @@ func cfgPersistentSpecialMountsWithHandoffAt(spec *specs.Spec, podsDir, handoffD
 		filtered = append(filtered, mount)
 	}
 	for _, mapping := range config.mappings {
-		source, err := persistentUpperMountSource(config, mapping)
+		source, err := persistentSpecialMountSource(config, mapping)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		filtered = append(filtered, specs.Mount{
 			Source:      source,
@@ -110,7 +118,15 @@ func cfgPersistentSpecialMountsWithHandoffAt(spec *specs.Spec, podsDir, handoffD
 		})
 	}
 	spec.Mounts = filtered
-	return nil
+	persistent := make(map[string]string, len(config.mappings))
+	for _, mapping := range config.mappings {
+		source, err := persistentSpecialMountSource(config, mapping)
+		if err != nil {
+			return nil, err
+		}
+		persistent[filepath.Clean(mapping.Destination)] = source
+	}
+	return persistent, nil
 }
 
 func resolvePersistentSpecialConfig(spec *specs.Spec, podsDir string) (persistentSpecialConfig, bool, error) {
@@ -118,9 +134,6 @@ func resolvePersistentSpecialConfig(spec *specs.Spec, podsDir string) (persisten
 }
 
 func resolvePersistentSpecialConfigWithHandoff(spec *specs.Spec, podsDir, handoffDir, containerID string) (persistentSpecialConfig, bool, error) {
-	if spec.Annotations[persistentSpecialAnnotation] != "true" {
-		return persistentSpecialConfig{}, false, nil
-	}
 	raw := spec.Annotations[rootfsRwLayerAnnotation]
 	if raw == "" {
 		return persistentSpecialConfig{}, false, nil
@@ -155,6 +168,12 @@ func resolvePersistentSpecialConfigWithHandoff(spec *specs.Spec, podsDir, handof
 		return persistentSpecialConfig{}, false, fmt.Errorf("container %q has %d rootfs rw-layer entries", containerName, len(matching))
 	}
 	entry := matching[0]
+	if !entry.PersistentSpecialMounts {
+		if len(entry.SpecialPath) > 0 {
+			return persistentSpecialConfig{}, false, fmt.Errorf("container %q specialPath requires persistentSpecialMounts", containerName)
+		}
+		return persistentSpecialConfig{}, false, nil
+	}
 	if entry.VolumeName == "" {
 		return persistentSpecialConfig{}, false, fmt.Errorf("container %q rootfs rw-layer volumeName is empty", containerName)
 	}
@@ -240,6 +259,13 @@ func resolvePersistentSpecialConfigWithHandoff(spec *specs.Spec, podsDir, handof
 		}
 		mappings = append(mappings, persistentSpecialMapping{Name: info.name, Destination: destination})
 	}
+	for _, path := range entry.SpecialPath {
+		destination := filepath.Clean(path)
+		if !filepath.IsAbs(destination) || destination == string(filepath.Separator) {
+			return persistentSpecialConfig{}, false, fmt.Errorf("custom special directory destination %q must be an absolute non-root path", path)
+		}
+		mappings = append(mappings, persistentSpecialMapping{Name: destination, Destination: destination})
+	}
 	for i := range mappings {
 		for j := i + 1; j < len(mappings); j++ {
 			left := mappings[i].Destination
@@ -250,11 +276,11 @@ func resolvePersistentSpecialConfigWithHandoff(spec *specs.Spec, podsDir, handof
 		}
 	}
 	return persistentSpecialConfig{
-		entry:     entry,
-		pvcRoot:   pvcRoot,
-		layerRoot: layerRoot,
-		upperRoot: filepath.Join(layerRoot, "upper"),
-		mappings:  mappings,
+		entry:       entry,
+		pvcRoot:     pvcRoot,
+		layerRoot:   layerRoot,
+		specialRoot: filepath.Join(layerRoot, "special"),
+		mappings:    mappings,
 	}, true, nil
 }
 
@@ -378,30 +404,30 @@ func rejectPersistentSpecialSymlinks(root, target string) error {
 	return nil
 }
 
-// initializePersistentUpperMounts creates the raw-upper mount sources. On their
+// initializePersistentSpecialMounts creates the PVC-backed special mount sources. On their
 // first creation, it seeds each source from the merged image rootfs before runc
 // installs the bind mount that would otherwise hide the image contents. Existing
 // directories are PVC state and are never re-seeded or overwritten.
-func initializePersistentUpperMounts(spec *specs.Spec, config persistentSpecialConfig) error {
+func initializePersistentSpecialMounts(spec *specs.Spec, config persistentSpecialConfig) error {
 	if spec == nil || spec.Root == nil || spec.Root.Path == "" {
 		return fmt.Errorf("container rootfs is missing")
 	}
 	if err := os.MkdirAll(config.layerRoot, 0o755); err != nil {
-		return fmt.Errorf("create persistent upper layer root: %w", err)
+		return fmt.Errorf("create persistent special layer root: %w", err)
 	}
-	if err := rejectPersistentSpecialSymlinks(config.layerRoot, config.upperRoot); err != nil {
+	if err := rejectPersistentSpecialSymlinks(config.layerRoot, config.specialRoot); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(config.upperRoot, 0o755); err != nil {
-		return fmt.Errorf("create persistent upper root: %w", err)
+	if err := os.MkdirAll(config.specialRoot, 0o755); err != nil {
+		return fmt.Errorf("create persistent special root: %w", err)
 	}
-	lock, err := openPersistentSpecialLock(filepath.Join(config.layerRoot, ".persistent-upper-mounts.lock"))
+	lock, err := openPersistentSpecialLock(filepath.Join(config.layerRoot, ".persistent-special-mounts.lock"))
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
 	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
-		return fmt.Errorf("lock persistent upper mounts: %w", err)
+		return fmt.Errorf("lock persistent special mounts: %w", err)
 	}
 	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN) //nolint:errcheck
 
@@ -410,19 +436,19 @@ func initializePersistentUpperMounts(spec *specs.Spec, config persistentSpecialC
 		return fmt.Errorf("resolve container rootfs: %w", err)
 	}
 	for _, mapping := range config.mappings {
-		destination, err := persistentUpperMountSource(config, mapping)
+		destination, err := persistentSpecialMountSource(config, mapping)
 		if err != nil {
 			return err
 		}
 		info, statErr := os.Lstat(destination)
 		if statErr == nil {
 			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-				return fmt.Errorf("persistent upper directory %s is missing or invalid", mapping.Destination)
+				return fmt.Errorf("persistent special directory %s is missing or invalid", mapping.Destination)
 			}
 			continue
 		}
 		if !errors.Is(statErr, os.ErrNotExist) {
-			return fmt.Errorf("stat persistent upper directory %s: %w", mapping.Destination, statErr)
+			return fmt.Errorf("stat persistent special directory %s: %w", mapping.Destination, statErr)
 		}
 
 		var uidMappings, gidMappings []specs.LinuxIDMapping
@@ -430,24 +456,24 @@ func initializePersistentUpperMounts(spec *specs.Spec, config persistentSpecialC
 			uidMappings = spec.Linux.UIDMappings
 			gidMappings = spec.Linux.GIDMappings
 		}
-		if err := seedPersistentUpperDirectory(rootfs, destination, mapping, uidMappings, gidMappings); err != nil {
+		if err := seedPersistentSpecialDirectory(rootfs, destination, mapping, uidMappings, gidMappings); err != nil {
 			return err
 		}
 	}
-	return validatePersistentUpperMounts(config)
+	return validatePersistentSpecialMounts(config)
 }
 
-// seedPersistentUpperDirectory publishes one initialized directory atomically.
+// seedPersistentSpecialDirectory publishes one initialized directory atomically.
 // Its destination is intentionally not created before the seed completes: the
 // existence of that directory is the durable indication that PVC state owns it.
-func seedPersistentUpperDirectory(rootfs, destination string, mapping persistentSpecialMapping, uidMappings, gidMappings []specs.LinuxIDMapping) error {
+func seedPersistentSpecialDirectory(rootfs, destination string, mapping persistentSpecialMapping, uidMappings, gidMappings []specs.LinuxIDMapping) error {
 	parent := filepath.Dir(destination)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return fmt.Errorf("create persistent upper parent for %s: %w", mapping.Destination, err)
+		return fmt.Errorf("create persistent special parent for %s: %w", mapping.Destination, err)
 	}
 	staging, err := os.MkdirTemp(parent, "."+filepath.Base(destination)+".seed-")
 	if err != nil {
-		return fmt.Errorf("create persistent upper staging directory %s: %w", mapping.Destination, err)
+		return fmt.Errorf("create persistent special staging directory %s: %w", mapping.Destination, err)
 	}
 	committed := false
 	defer func() {
@@ -471,14 +497,14 @@ func seedPersistentUpperDirectory(rootfs, destination string, mapping persistent
 			return fmt.Errorf("image special path %s is not a real directory", mapping.Destination)
 		}
 		if err := rsyncPersistentSpecialDir(source, staging, uidMappings, gidMappings); err != nil {
-			return fmt.Errorf("seed persistent upper directory %s: %w", mapping.Destination, err)
+			return fmt.Errorf("seed persistent special directory %s: %w", mapping.Destination, err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat image special directory %s: %w", mapping.Destination, err)
 	}
 
 	if err := os.Rename(staging, destination); err != nil {
-		return fmt.Errorf("commit persistent upper directory %s: %w", mapping.Destination, err)
+		return fmt.Errorf("commit persistent special directory %s: %w", mapping.Destination, err)
 	}
 	committed = true
 	return nil
@@ -492,32 +518,32 @@ func openPersistentSpecialLock(path string) (*os.File, error) {
 	return os.NewFile(uintptr(fd), path), nil
 }
 
-func persistentUpperMountSource(config persistentSpecialConfig, mapping persistentSpecialMapping) (string, error) {
+func persistentSpecialMountSource(config persistentSpecialConfig, mapping persistentSpecialMapping) (string, error) {
 	relative := strings.TrimPrefix(filepath.Clean(mapping.Destination), string(filepath.Separator))
-	lexical := filepath.Join(config.upperRoot, relative)
-	if err := rejectPersistentSpecialSymlinks(config.upperRoot, lexical); err != nil {
+	lexical := filepath.Join(config.specialRoot, relative)
+	if err := rejectPersistentSpecialSymlinks(config.specialRoot, lexical); err != nil {
 		return "", err
 	}
-	source, err := securejoin.SecureJoin(config.upperRoot, relative)
+	source, err := securejoin.SecureJoin(config.specialRoot, relative)
 	if err != nil {
-		return "", fmt.Errorf("resolve persistent upper directory %s: %w", mapping.Destination, err)
+		return "", fmt.Errorf("resolve persistent special directory %s: %w", mapping.Destination, err)
 	}
 	return source, nil
 }
 
-func validatePersistentUpperMounts(config persistentSpecialConfig) error {
-	info, err := os.Lstat(config.upperRoot)
+func validatePersistentSpecialMounts(config persistentSpecialConfig) error {
+	info, err := os.Lstat(config.specialRoot)
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("persistent upper root is missing or invalid")
+		return fmt.Errorf("persistent special root is missing or invalid")
 	}
 	for _, mapping := range config.mappings {
-		source, err := persistentUpperMountSource(config, mapping)
+		source, err := persistentSpecialMountSource(config, mapping)
 		if err != nil {
 			return err
 		}
 		entryInfo, err := os.Lstat(source)
 		if err != nil || entryInfo.Mode()&os.ModeSymlink != 0 || !entryInfo.IsDir() {
-			return fmt.Errorf("persistent upper directory %s is missing or invalid", mapping.Destination)
+			return fmt.Errorf("persistent special directory %s is missing or invalid", mapping.Destination)
 		}
 	}
 	return nil
