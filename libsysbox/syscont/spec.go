@@ -638,6 +638,9 @@ func cfgMounts(spec *specs.Spec, sysbox *sysbox.Sysbox) error {
 
 	// We will modify the container's mounts; remember the original ones
 	sysbox.OrigMounts = spec.Mounts
+	if err := initializePVCVolumes(sysbox, spec); err != nil {
+		return err
+	}
 
 	if sysMgr.Config.SyscontMode {
 		cfgSyscontMounts(sysMgr, spec)
