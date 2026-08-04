@@ -454,6 +454,17 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 		if err := mkdirall(dest, 0755, config, pipe); err != nil {
 			return fmt.Errorf("failed to created dir for %s mount: %v", m.Device, err)
 		}
+		if m.Device == "sysfs" {
+			req := opReq{
+				Op:     sysfs,
+				Rootfs: config.Rootfs,
+				Mount:  *m,
+			}
+			if err := syncParentDoOp([]opReq{req}, pipe); err != nil {
+				return newSystemErrorWithCause(err, "syncing with parent runc to perform sysfs mount")
+			}
+			return nil
+		}
 		// Selinux kernels do not support labeling of /proc or /sys
 		return mountPropagate(m, ".", "")
 	case "mqueue":
@@ -527,6 +538,16 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 	}
 }
 
+// mntDestDependsOn returns true if mount destination dest is equal to, or
+// nested inside, mount destination prior. Both paths must be absolute and
+// clean (e.g., as returned by filepath.Join("/", path)).
+func mntDestDependsOn(dest, prior string) bool {
+	if prior == "/" {
+		return true
+	}
+	return dest == prior || strings.HasPrefix(dest, prior+"/")
+}
+
 func doBindMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermountsOnly bool) error {
 
 	// sysbox-runc: the sys container's init process is in a dedicated
@@ -559,15 +580,42 @@ func doBindMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermoun
 			continue
 		}
 
-		// Determine if the current mount is dependent on a prior one.
+		// Determine if the current mount is nested under a still-pending prior
+		// mount's destination. The true condition is "would the destination
+		// resolve into the pending mount once that mount is performed", which
+		// can't be computed before actually performing it, so we approximate
+		// it from both sides and flush if either check matches (a false
+		// positive just costs one extra request to the parent):
+		//
+		// - The resolved check catches symlinks *outside* the pending
+		//   mountpoint, which survive the flush. E.g., image symlink
+		//   "/var/run" -> "/run" with a pending mount at "/run": a mount at
+		//   "/var/run/foo" must flush, but a literal comparison misses the
+		//   dependency and the mount later fails with ENOENT. mntReqs
+		//   destinations are already resolved by prepareBindDest(), so
+		//   resolving here the same way keeps the comparison apples-to-apples.
+		//
+		// - The literal check catches paths that enter the pending mountpoint
+		//   through image symlinks *underneath* it, which the flush shadows.
+		//   E.g., image symlink "/run/shm" -> "/dev/shm" with a pending mount
+		//   at "/run": a mount at "/run/shm/foo" must flush so that it lands
+		//   at run/shm/foo on top of the pending mount (matching inline,
+		//   in-order mounting), but pre-flush resolution follows the image
+		//   symlink to "dev/shm/foo" and would silently place the mount at
+		//   the wrong location.
+
+		resolvedDest, err := securejoin.SecureJoin(".", m.Destination)
+		if err != nil {
+			return err
+		}
+
 		mntDependsOnPrior := false
 		for _, mr := range mntReqs {
-
-			// Mount destinations in mntReqs are relative to the rootfs
-			// (see prepareBindDest()); thus we need to prepend "/" for a
-			// proper comparison.
-			if strings.HasPrefix(m.Destination, filepath.Join("/", mr.Mount.Destination)) {
+			priorDest := filepath.Join("/", mr.Mount.Destination)
+			if mntDestDependsOn(filepath.Join("/", m.Destination), priorDest) ||
+				mntDestDependsOn(filepath.Join("/", resolvedDest), priorDest) {
 				mntDependsOnPrior = true
+				break
 			}
 		}
 
