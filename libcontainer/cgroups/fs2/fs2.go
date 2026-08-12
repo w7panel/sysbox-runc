@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package fs2
@@ -23,7 +24,10 @@ type manager struct {
 	// excludes pseudo-controllers ("devices" and "freezer").
 	controllers map[string]struct{}
 	rootless    bool
+	nestedStage int
 }
+
+const nestedDelegate = "sysbox.delegate"
 
 // NewManager creates a manager for cgroup v2 unified hierarchy.
 // dirPath is like "/sys/fs/cgroup/user.slice/user-1001.slice/session-1.scope".
@@ -273,6 +277,12 @@ func (m *manager) CreateChildCgroup(config *configs.Config) error {
 	// Change the cgroup ownership to match the root user in the system
 	// container (needed for delegation).
 	path := m.dirPath
+	if config.NestedIdentity {
+		path = filepath.Join(path, nestedDelegate)
+		if err := os.MkdirAll(path, 0755); err != nil {
+			return err
+		}
+	}
 
 	rootuid, err := config.HostRootUID()
 	if err != nil {
@@ -358,13 +368,54 @@ func (m *manager) CreateChildCgroup(config *configs.Config) error {
 }
 
 func (m *manager) ApplyChildCgroup(pid int) error {
+	if m.config.NestedIdentity && m.nestedStage == 0 {
+		m.nestedStage++
+		return cgroups.EnterPid(map[string]string{"": filepath.Join(m.dirPath, nestedDelegate)}, pid)
+	}
 	paths := make(map[string]string, 1)
-	paths[""] = filepath.Join(m.dirPath, "init.scope")
-	return cgroups.EnterPid(paths, pid)
+	base := m.dirPath
+	if m.config.NestedIdentity {
+		base = filepath.Join(base, nestedDelegate)
+	}
+	paths[""] = filepath.Join(base, "init.scope")
+	if err := cgroups.EnterPid(paths, pid); err != nil {
+		return err
+	}
+	if m.config.NestedIdentity {
+		return enableNestedControllers(m.dirPath, base)
+	}
+	return nil
 }
 
 func (m *manager) GetChildCgroupPaths() map[string]string {
+	if m.config.NestedIdentity {
+		return map[string]string{"": filepath.Join(m.dirPath, nestedDelegate, "init.scope")}
+	}
 	return m.GetPaths()
+}
+
+func enableNestedControllers(limitPath, delegatePath string) error {
+	for _, path := range []string{limitPath, delegatePath} {
+		procs, err := fscommon.ReadFile(path, "cgroup.procs")
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(procs) != "" {
+			return fmt.Errorf("nested cgroup delegation node %s still contains processes", path)
+		}
+		controllers, err := fscommon.ReadFile(path, "cgroup.controllers")
+		if err != nil {
+			return err
+		}
+		fields := strings.Fields(controllers)
+		if len(fields) == 0 {
+			continue
+		}
+		if err := fscommon.WriteFile(path, "cgroup.subtree_control", "+"+strings.Join(fields, " +")); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *manager) GetType() cgroups.CgroupType {

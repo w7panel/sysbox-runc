@@ -317,11 +317,13 @@ func (l *linuxRootfsInit) Init() error {
 
 		// We are in the pid and mount ns of the container's init process; remount
 		// /proc so that it picks up this fact.
-		os.Lstat("/proc")
-		if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-			return newSystemErrorWithCause(err, "re-mounting procfs")
+		if !l.reqs[0].SkipSpecialMounts {
+			os.Lstat("/proc")
+			if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+				return newSystemErrorWithCause(err, "re-mounting procfs")
+			}
+			defer unix.Unmount("/proc", unix.MNT_DETACH)
 		}
-		defer unix.Unmount("/proc", unix.MNT_DETACH)
 
 		fsName, err := utils.GetFsName(rootfs)
 		if err != nil {
@@ -482,11 +484,13 @@ func (l *linuxRootfsInit) Init() error {
 
 		// We are in the pid and mount ns of the container's init process; remount
 		// /proc so that it picks up this fact.
-		os.Lstat("/proc")
-		if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-			return newSystemErrorWithCause(err, "re-mounting procfs")
+		if !l.reqs[0].SkipSpecialMounts {
+			os.Lstat("/proc")
+			if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
+				return newSystemErrorWithCause(err, "re-mounting procfs")
+			}
+			defer unix.Unmount("/proc", unix.MNT_DETACH)
 		}
-		defer unix.Unmount("/proc", unix.MNT_DETACH)
 
 		usernsPath := "/proc/1/ns/user"
 		fsuidMapFailOnErr := l.reqs[0].FsuidMapFailOnErr
@@ -546,13 +550,18 @@ func (l *linuxRootfsInit) Init() error {
 		}
 
 	case sysfs:
+		// A nested user namespace cannot mount sysfs. The dedicated
+		// command-mode inner runtime runs without the special proc/sys mounts,
+		// so there is no usable target for this late helper mount either.
+		if l.reqs[0].SkipSpecialMounts {
+			return nil
+		}
 		rootfs := l.reqs[0].Rootfs
 		m := &l.reqs[0].Mount
 
 		if err := unix.Chdir(rootfs); err != nil {
 			return newSystemErrorWithCausef(err, "chdir to rootfs %s", rootfs)
 		}
-
 		if err := libcontainerUtils.WithProcfd(".", m.Destination, func(procfd string) error {
 			return unix.Mount(m.Source, procfd, m.Device, uintptr(m.Flags), m.Data)
 		}); err != nil {

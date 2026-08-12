@@ -642,18 +642,28 @@ void join_namespaces(char *nslist)
 	} while ((namespace = strtok_r(NULL, ",", &saveptr)) != NULL);
 
 	/*
-	 * Ordering matters here. Per setns(2), joining the netns requires
-	 * CAP_SYS_ADMIN in the user namespace that owns it, which is the
-	 * host's, not the container's. Once we setns(2)/unshare(2) into the
-	 * container's user namespace, that host capability is gone for good
-	 * (user_namespaces(7)), so the netns join would then fail. Hence we
-	 * join the netns first and the user namespace last.
+	 * Ordering matters here. Per setns(2), joining a namespace requires
+	 * CAP_SYS_ADMIN in the user namespace that owns it. Once we enter a
+	 * descendant user namespace we must not attempt to join any remaining
+	 * namespaces from its parent: the task's credentials may no longer have
+	 * the necessary capability there. Join netns first (for the usual runc
+	 * case), move userns to the end, and only then switch identity.
 	 */
 	for (i = 0; i < num; i++) {
 		if (namespaces[i].ns == CLONE_NEWNET && i > 0) {
 			struct namespace_t netns = namespaces[i];
 			memmove(&namespaces[1], &namespaces[0], i * sizeof(struct namespace_t));
 			namespaces[0] = netns;
+			break;
+		}
+	}
+
+	for (i = 0; i < num; i++) {
+		if (namespaces[i].ns == CLONE_NEWUSER && i != num - 1) {
+			struct namespace_t userns = namespaces[i];
+			memmove(&namespaces[i], &namespaces[i + 1],
+				(num - i - 1) * sizeof(struct namespace_t));
+			namespaces[num - 1] = userns;
 			break;
 		}
 	}

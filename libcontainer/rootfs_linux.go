@@ -454,7 +454,19 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 		if err := mkdirall(dest, 0755, config, pipe); err != nil {
 			return fmt.Errorf("failed to created dir for %s mount: %v", m.Device, err)
 		}
-		if m.Device == "sysfs" {
+		if config.SkipSpecialMounts && m.Device == "sysfs" {
+			return nil
+		}
+		if config.SkipSpecialMounts && m.Device == "proc" {
+			if config.NestedIdentity {
+				// Let the L2 init/systemd issue the mount syscall after the
+				// seccomp-notify listener is active; L0 sysbox-fs will service it
+				// in the L2 mount and user namespaces.
+				return nil
+			}
+			return unix.Mount(m.Source, m.Destination, m.Device, uintptr(m.Flags), m.Data)
+		}
+		if m.Device == "sysfs" && !config.NestedIdentity {
 			req := opReq{
 				Op:     sysfs,
 				Rootfs: config.Rootfs,
@@ -573,6 +585,13 @@ func doBindMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermoun
 		if m.Device != "bind" {
 			continue
 		}
+		// In command-mode nested Sysbox, sysbox-fs's proc/sys emulation
+		// sources are not mountable through the outer user namespace. Match the
+		// source rather than the destination: at this stage destinations can be
+		// relative to the rootfs, while SysboxfsMounts are absolute.
+		if config.SkipSpecialMounts && strings.HasPrefix(m.Source, "/var/lib/sysboxfs") {
+			continue
+		}
 
 		isSysboxfsOvermount := isSysboxfsOvermount(m)
 		if doSysboxfsOvermountsOnly && !isSysboxfsOvermount ||
@@ -645,8 +664,8 @@ func doBindMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermoun
 			Label:             config.MountLabel,
 			Rootfs:            config.Rootfs,
 			FsuidMapFailOnErr: config.FsuidMapFailOnErr,
+			SkipSpecialMounts: config.SkipSpecialMounts,
 		}
-
 		mntReqs = append(mntReqs, req)
 	}
 
@@ -1326,6 +1345,9 @@ func doRootfsIDMapping(config *configs.Config, pipe io.ReadWriter) error {
 // If sysboxfsOvermounts is true, then only mounts on top of sysbox-fs emulated paths are
 // mounted (e.g., mounts under /proc/sys/). Otherwise such mounts are skipped.
 func doMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermountsOnly bool) error {
+	if doSysboxfsOvermountsOnly && config.SkipSpecialMounts {
+		return nil
+	}
 
 	chownList := []string{}
 
@@ -1354,7 +1376,7 @@ func doMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermountsOn
 			// changing ownership of any sysfs mountpoint causes the ownership
 			// change to propagate to all other sysfs mountpoints in the system.
 
-			if m.Device == "proc" {
+			if m.Device == "proc" && !config.NestedIdentity {
 				chownList = append(chownList, "proc")
 			}
 		}

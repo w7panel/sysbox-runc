@@ -121,6 +121,13 @@ type Config struct {
 
 	MountLabel string `json:"mount_label"`
 
+	// SkipSpecialMounts is an experimental nested-Sysbox mode.
+	SkipSpecialMounts bool `json:"skip_special_mounts"`
+
+	// NestedIdentity indicates that uid/gid 0 map to uid/gid 0 in the parent
+	// (non-initial) user namespace.
+	NestedIdentity bool `json:"nested_identity"`
+
 	// Hostname optionally sets the container's hostname if provided
 	Hostname string `json:"hostname"`
 

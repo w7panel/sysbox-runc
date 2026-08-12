@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	ipcLib "github.com/nestybox/sysbox-ipc/sysboxMgrLib"
 	"github.com/nestybox/sysbox-libs/dockerUtils"
 	"github.com/nestybox/sysbox-runc/internals/pathrs"
 	"github.com/opencontainers/runc/libcontainer"
@@ -319,6 +320,7 @@ func createContainer(context *cli.Context,
 		RootfsCloned:        sysbox.RootfsCloned,
 		FsuidMapFailOnErr:   sysMgr.Config.FsuidMapFailOnErr,
 		IDshiftIgnoreList:   sysbox.IDshiftIgnoreList,
+		NestedIdentity:      sysMgr.Config.MappingMode == ipcLib.NestedIdentity,
 	})
 	if err != nil {
 		return nil, err
@@ -326,7 +328,7 @@ func createContainer(context *cli.Context,
 
 	// sysbox-runc: For container's proper operation, collect from sysbox-mgr
 	// fsState to be added to container's rootfs.
-	if sysMgr.Enabled() {
+	if sysMgr.Enabled() && sysMgr.Config.MappingMode != ipcLib.NestedIdentity {
 		if err := sysMgrGetFsState(sysMgr, config); err != nil {
 			return nil, err
 		}

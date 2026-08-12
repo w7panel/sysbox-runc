@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package specconv
@@ -281,6 +282,21 @@ func TestLinuxCgroupWithMemoryResource(t *testing.T) {
 	}
 	if cgroup.Resources.OomKillDisable != disableOOMKiller {
 		t.Errorf("The OOMKiller should be enabled")
+	}
+}
+
+func TestNestedIdentitySkipsCgroupDeviceFilter(t *testing.T) {
+	spec := &specs.Spec{Linux: &specs.Linux{Resources: &specs.LinuxResources{}}}
+	cgroup, err := CreateCgroupConfig(&CreateOpts{
+		CgroupName:     "nested",
+		Spec:           spec,
+		NestedIdentity: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cgroup.Resources.SkipDevices {
+		t.Fatal("nested identity must inherit the L1 device policy")
 	}
 }
 

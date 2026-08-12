@@ -332,6 +332,7 @@ type CreateOpts struct {
 	RootlessCgroups     bool
 	RootfsUidShiftType  sh.IDShiftType
 	BindMntUidShiftType sh.IDShiftType
+	NestedIdentity      bool
 	SwitchDockerDns     bool
 	RootfsCloned        bool
 	FsuidMapFailOnErr   bool
@@ -377,6 +378,12 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		RootfsCloned:        opts.RootfsCloned,
 		FsuidMapFailOnErr:   opts.FsuidMapFailOnErr,
 		IDshiftIgnoreList:   opts.IDshiftIgnoreList,
+		// The environment form is used only by the command-mode nested Sysbox
+		// runtime wrapper. Unlike arbitrary Kubernetes annotations it is
+		// guaranteed to reach the runc parent process, which serializes this
+		// setting into initConfig for the child init process.
+		SkipSpecialMounts: spec.Annotations["sysbox/skip-special-mounts"] == "true" || os.Getenv("SYSBOX_SKIP_SPECIAL_MOUNTS") == "true" || opts.NestedIdentity,
+		NestedIdentity:    opts.NestedIdentity,
 	}
 
 	for _, m := range spec.Mounts {
@@ -445,6 +452,9 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 				return nil, err
 			}
 			config.Seccomp = seccomp
+		}
+		if config.SkipSpecialMounts || config.NestedIdentity {
+			config.Seccomp = nil
 		}
 		if spec.Linux.IntelRdt != nil {
 			config.IntelRdt = &configs.IntelRdt{}
@@ -606,7 +616,12 @@ func CreateCgroupConfig(opts *CreateOpts, defaultDevs []*devices.Device) (*confi
 	)
 
 	c := &configs.Cgroup{
-		Resources: &configs.Resources{},
+		Resources: &configs.Resources{
+			// A cgroup device BPF program cannot be loaded from a non-initial
+			// user namespace. Nested containers inherit the L1 device policy.
+			SkipDevices: opts.NestedIdentity,
+		},
+		NestedIdentity: opts.NestedIdentity,
 	}
 
 	if useSystemdCgroup {

@@ -281,7 +281,7 @@ func (c *linuxContainer) Start(process *Process) error {
 
 	config := c.config
 
-	if config.Cgroups.Resources.SkipDevices {
+	if config.Cgroups.Resources.SkipDevices && !config.NestedIdentity {
 		return newGenericError(errors.New("can't start container with SkipDevices set"), ConfigInvalid)
 	}
 
@@ -566,7 +566,13 @@ func (c *linuxContainer) deleteExecFifo() {
 // fd, with _LIBCONTAINER_FIFOFD set to its fd number.
 func (c *linuxContainer) includeExecFifo(cmd *exec.Cmd) error {
 	fifoName := filepath.Join(c.root, execFifoFilename)
-	fifoFd, err := unix.Open(fifoName, unix.O_PATH|unix.O_CLOEXEC, 0)
+	flags := unix.O_PATH | unix.O_CLOEXEC
+	// Nested command-mode Sysbox has no procfs, so its init cannot reopen an
+	// O_PATH FIFO through /proc/self/fd. Pass a real read-write fd instead.
+	if c.config.SkipSpecialMounts {
+		flags = unix.O_RDWR | unix.O_CLOEXEC
+	}
+	fifoFd, err := unix.Open(fifoName, flags, 0)
 	if err != nil {
 		return err
 	}
@@ -1640,6 +1646,11 @@ func (c *linuxContainer) criuApplyCgroups(pid int, req *criurpc.CriuReq) error {
 	if err := c.cgroupManager.ApplyChildCgroup(pid); err != nil {
 		return err
 	}
+	if c.config.NestedIdentity {
+		if err := c.cgroupManager.ApplyChildCgroup(pid); err != nil {
+			return err
+		}
+	}
 
 	if err := c.cgroupManager.Set(c.config); err != nil {
 		return newSystemError(err)
@@ -2272,7 +2283,10 @@ func (c *linuxContainer) bootstrapData(cloneFlags uintptr, nsMaps map[configs.Na
 		}
 	}
 
-	if c.config.OomScoreAdj != nil {
+	if c.config.SkipSpecialMounts {
+		// The nested command mode intentionally has no procfs. Do not ask
+		// nsexec to restore oom_score_adj after it has entered the container.
+	} else if c.config.OomScoreAdj != nil {
 		// write the configured oom_score_adj
 		r.AddData(&Bytemsg{
 			Type:  OomScoreAdjAttr,

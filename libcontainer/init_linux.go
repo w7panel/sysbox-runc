@@ -175,8 +175,10 @@ func finalizeNamespace(config *initConfig) error {
 	// XXX: CloseExecFrom relies on the presence procfs being mounted inside the sys container.
 	// This means a setns entry into the sys container (e.g., via docker exec) would fail if
 	// /proc is not mounted in the container.
-	if err := utils.CloseExecFrom(config.PassedFilesCount + 3); err != nil {
-		return errors.Wrap(err, "close exec fds")
+	if !config.Config.SkipSpecialMounts {
+		if err := utils.CloseExecFrom(config.PassedFilesCount + 3); err != nil {
+			return errors.Wrap(err, "close exec fds")
+		}
 	}
 
 	capabilities := &configs.Capabilities{}
@@ -415,20 +417,22 @@ func setupUser(config *initConfig) error {
 	// per-userns file and thus is global to all threads in a thread-group.
 	// This lets us avoid having to do runtime.LockOSThread.
 	var setgroups []byte
-	setgroupsFile, err := pathrs.ProcSelfOpen("setgroups", unix.O_RDONLY)
-	if err == nil {
-		setgroups, err = io.ReadAll(setgroupsFile)
-		_ = setgroupsFile.Close()
-	}
-	if err != nil && !os.IsNotExist(err) {
-		return err
+	if !config.Config.SkipSpecialMounts {
+		setgroupsFile, err := pathrs.ProcSelfOpen("setgroups", unix.O_RDONLY)
+		if err == nil {
+			setgroups, err = io.ReadAll(setgroupsFile)
+			_ = setgroupsFile.Close()
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 
 	// This isn't allowed in an unprivileged user namespace since Linux 3.19.
 	// There's nothing we can do about /etc/group entries, so we silently
 	// ignore setting groups here (since the user didn't explicitly ask us to
 	// set the group).
-	allowSupGroups := !config.RootlessEUID && string(bytes.TrimSpace(setgroups)) != "deny"
+	allowSupGroups := !config.Config.SkipSpecialMounts && !config.RootlessEUID && string(bytes.TrimSpace(setgroups)) != "deny"
 
 	if allowSupGroups {
 		suppGroups := append(execUser.Sgids, addGroups...)
@@ -675,6 +679,13 @@ func signalAllProcesses(m cgroups.Manager, s os.Signal) error {
 
 // setupSyscallTraps sets up syscall trapping for the calling process, using seccomp.
 func setupSyscallTraps(config *initConfig, pipe *os.File) error {
+	// A nested container inherits the L1 seccomp-notify filter through the
+	// Docker/runc process tree. Linux rejects installing a second listener in
+	// this hierarchy with EBUSY; leave the inherited filter/listener in place.
+	if config.Config.SkipSpecialMounts {
+		config.Config.SeccompNotif = nil
+		return nil
+	}
 
 	// Load the seccomp notification filter here (for syscall trapping inside the container)
 	if config.Config.SeccompNotif != nil && len(config.Config.SeccompNotif.Syscalls) > 0 {
