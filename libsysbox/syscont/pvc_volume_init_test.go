@@ -131,6 +131,30 @@ func TestInitializePVCVolumesSupportsDirectorySubPath(t *testing.T) {
 	}
 }
 
+func TestInitializePVCVolumesSupportsGeneratedContainerNameForSubPath(t *testing.T) {
+	podsDir := t.TempDir()
+	rootfs := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rootfs, "data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, "data", "image.txt"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(podsDir, "pod-uid", "volume-subpaths", "pvc-631034ef-744e-4a08-b91f-67b666ff5616", "test-phpbeta-74-ffzg", "0")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spec := testVolumeInitSpec(rootfs, source, `[{"name":"test-phpbeta-74-ffzg-54f8cb585c-gmz4v","volumeName":"data","mountPath":"/data"}]`)
+	spec.Annotations[kubernetesContainerNameAnno] = "test-phpbeta-74-ffzg-54f8cb585c-gmz4v"
+
+	if err := initializePVCVolumesAt(spec, podsDir, sh.IDMappedMount, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(source, "image.txt")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestInitializePVCVolumesSkipsFileMount(t *testing.T) {
 	podsDir := t.TempDir()
 	rootfs := t.TempDir()

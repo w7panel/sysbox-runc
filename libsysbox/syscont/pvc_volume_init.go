@@ -163,7 +163,16 @@ func validateAnnotatedPVCSource(source, podUID, containerName, volumeName, podsD
 	subpathRoot := filepath.Join(podRoot, "volume-subpaths")
 	if rel, relErr := filepath.Rel(subpathRoot, cleanSource); relErr == nil {
 		parts := strings.Split(rel, string(filepath.Separator))
-		if len(parts) == 3 && parts[0] == volumeName && parts[1] == containerName && parts[2] != "" {
+		if len(parts) != 3 {
+			return "", false, fmt.Errorf("PVC volume %q source %q does not belong to the current Pod and container", volumeName, source)
+		}
+		// Kubelet may use the pod-spec container name for the volume-subpaths
+		// directory while CRI gives the runtime the generated container name
+		// (for example, "app" vs "app-54f8cb585c-gmz4v").
+		containerDir := parts[1]
+		containerMatches := containerDir == containerName || strings.HasPrefix(containerName, containerDir+"-")
+		volumeDirMatches := parts[0] == volumeName || strings.HasPrefix(parts[0], "pvc-")
+		if volumeDirMatches && containerDir != "" && containerMatches && parts[2] != "" {
 			return validatePVCSource(cleanSource, volumeName)
 		}
 	}
