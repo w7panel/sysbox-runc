@@ -579,6 +579,24 @@ func (l *linuxRootfsInit) Init() error {
 			return newSystemErrorWithCausef(err, "change sysfs mount propagation through procfd to %s", m.Destination)
 		}
 
+	case procfs:
+		rootfs := l.reqs[0].Rootfs
+		m := &l.reqs[0].Mount
+		if err := unix.Chroot(rootfs); err != nil {
+			return newSystemErrorWithCausef(err, "chroot to rootfs %s", rootfs)
+		}
+		if err := unix.Chdir("/"); err != nil {
+			return newSystemErrorWithCause(err, "chdir to nested rootfs")
+		}
+		dest := "/" + strings.TrimPrefix(m.Destination, "/")
+		if err := os.MkdirAll(dest, 0755); err != nil {
+			return newSystemErrorWithCause(err, "creating nested procfs destination")
+		}
+		flags := uintptr(m.Flags) &^ uintptr(unix.MS_NOEXEC)
+		if err := unix.Mount(m.Source, dest, m.Device, flags, m.Data); err != nil {
+			return newSystemErrorWithCausef(err, "mounting nested procfs at %s", dest)
+		}
+
 	case switchDockerDns:
 		oldDns := l.reqs[0].OldDns
 		newDns := l.reqs[0].NewDns

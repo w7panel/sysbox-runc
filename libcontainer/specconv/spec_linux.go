@@ -20,6 +20,7 @@ import (
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
 	dbus "github.com/godbus/dbus/v5"
 	sh "github.com/nestybox/sysbox-libs/idShiftUtils"
+	utils "github.com/nestybox/sysbox-libs/utils"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/devices"
@@ -387,6 +388,12 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 	}
 
 	for _, m := range spec.Mounts {
+		// The nested-K3s Sysbox path executes /proc/self/exe while creating
+		// network namespaces. Apply the opt-in at the last OCI-to-libcontainer
+		// boundary as CRI v2 may have lost the original annotation earlier.
+		if filepath.Clean(m.Destination) == "/proc" {
+			m.Options = utils.StringSliceRemove(m.Options, []string{"noexec"})
+		}
 		mount, err := createLibcontainerMount(cwd, m)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create lib container mount: %v", err)

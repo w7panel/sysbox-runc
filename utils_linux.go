@@ -335,7 +335,12 @@ func createContainer(context *cli.Context,
 	}
 
 	// sysbox-runc: setup sys container syscall trapping
-	if sysFs.Enabled() {
+	// Nested L2 mounts must be authorized by the L2 user namespace itself.
+	// Installing another Sysbox notify filter here would send those calls to
+	// L1 sysbox-fs, whose helper is not the namespace owner and cannot safely
+	// perform them. L2 still inherits L1's outer listener, which explicitly
+	// continues nested procfs/sysfs calls in-kernel.
+	if sysFs.Enabled() && sysMgr.Config.MappingMode != ipcLib.NestedIdentity {
 		if err := syscont.AddSyscallTraps(config); err != nil {
 			return nil, err
 		}

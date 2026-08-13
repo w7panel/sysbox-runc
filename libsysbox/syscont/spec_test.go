@@ -295,7 +295,7 @@ func TestCfgProcExec(t *testing.T) {
 				{Destination: "/proc", Type: "proc", Options: []string{"noexec", "nosuid", "nodev"}},
 				{Destination: "/sys", Type: "sysfs", Options: []string{"noexec", "nosuid", "nodev"}},
 			}}
-			cfgProcExec(spec)
+			cfgProcExec(spec, false)
 			gotNoexec := false
 			for _, option := range spec.Mounts[0].Options {
 				gotNoexec = gotNoexec || option == "noexec"

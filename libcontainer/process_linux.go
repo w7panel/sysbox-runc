@@ -315,7 +315,14 @@ func (p *initProcess) externalDescriptors() []string {
 func (p *initProcess) getChildPid() (int, error) {
 	var pid pid
 	if err := json.NewDecoder(p.messageSockPair.parent).Decode(&pid); err != nil {
-		p.cmd.Wait()
+		nestedParentTrace(fmt.Sprintf("pidDecodeError=%v", err))
+		if p.cmd != nil && p.cmd.Process != nil {
+			if waitErr := p.cmd.Wait(); waitErr != nil {
+				nestedParentTrace(fmt.Sprintf("nsexecExit=%v", waitErr))
+			} else if p.cmd.ProcessState != nil {
+				nestedParentTrace(fmt.Sprintf("nsexecExit=%s", p.cmd.ProcessState.String()))
+			}
+		}
 		return -1, err
 	}
 
@@ -478,6 +485,17 @@ func (p *initProcess) start() (retErr error) {
 		return newSystemErrorWithCause(err, "updating the spec state")
 	}
 
+	// Nested init needs a private procfs before the rest of rootfs setup can use
+	// procfd mount helpers. Register it with sysbox-fs before sending the init
+	// config so the inherited seccomp-notify listener can service that first
+	// mount syscall in the L2 namespaces.
+	if p.config.Config.NestedIdentity {
+		if err := p.registerWithSysboxfs(childPid); err != nil {
+			return err
+		}
+		nestedParentTrace("registeredEarly")
+	}
+
 	if err := p.sendConfig(); err != nil {
 		return newSystemErrorWithCause(err, "sending config to init process")
 	}
@@ -574,8 +592,10 @@ func (p *initProcess) start() (retErr error) {
 				}
 			}
 			// Register container with sysbox-fs.
-			if err = p.registerWithSysboxfs(childPid); err != nil {
-				return err
+			if !p.config.Config.NestedIdentity {
+				if err = p.registerWithSysboxfs(childPid); err != nil {
+					return err
+				}
 			}
 			if p.config.Config.SkipSpecialMounts {
 				nestedParentTrace("registered")

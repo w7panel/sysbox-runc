@@ -273,6 +273,9 @@ func (m *manager) Exists() bool {
 }
 
 func (m *manager) CreateChildCgroup(config *configs.Config) error {
+	if config != nil && config.NestedIdentity && !cgroups.IsCgroup2UnifiedMode() {
+		return fmt.Errorf("nested-identity cgroup delegation requires cgroup v2")
+	}
 
 	// Change the cgroup ownership to match the root user in the system
 	// container (needed for delegation).
@@ -368,6 +371,9 @@ func (m *manager) CreateChildCgroup(config *configs.Config) error {
 }
 
 func (m *manager) ApplyChildCgroup(pid int) error {
+	if m.config.NestedIdentity && !cgroups.IsCgroup2UnifiedMode() {
+		return fmt.Errorf("nested-identity cgroup delegation requires cgroup v2")
+	}
 	if m.config.NestedIdentity && m.nestedStage == 0 {
 		m.nestedStage++
 		return cgroups.EnterPid(map[string]string{"": filepath.Join(m.dirPath, nestedDelegate)}, pid)

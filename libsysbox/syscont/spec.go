@@ -650,13 +650,20 @@ func cfgMounts(spec *specs.Spec, sysbox *sysbox.Sysbox) error {
 
 	// We will modify the container's mounts; remember the original ones
 	sysbox.OrigMounts = spec.Mounts
+	// Nested K3s uses the outer Sysbox container as a runtime boundary. The
+	// CRI v2 path can lose annotations before OCI conversion, so normalize
+	// the incoming proc mount before any Sysbox mount branch can replace it.
+	for i := range spec.Mounts {
+		if filepath.Clean(spec.Mounts[i].Destination) == "/proc" {
+			spec.Mounts[i].Options = utils.StringSliceRemove(spec.Mounts[i].Options, []string{"noexec"})
+		}
+	}
 	if err := initializePVCVolumes(sysbox, spec); err != nil {
 		return err
 	}
 
 	if sysMgr.Config.SyscontMode {
 		cfgSyscontMounts(sysMgr, spec)
-		cfgProcExec(spec)
 		ensureFuseDeviceAccess(spec)
 	}
 
@@ -675,6 +682,16 @@ func cfgMounts(spec *specs.Spec, sysbox *sysbox.Sysbox) error {
 		hasSystemd = true
 		cfgSystemdMounts(spec)
 	}
+
+	// cfgSyscontMounts and cfgSystemdMounts may replace the /proc mount;
+	// apply the explicit nested-K3s proc-exec opt-in after all mount injection.
+	// This must not be gated by SyscontMode: the outer K3s sandbox can carry
+	// the opt-in annotation while using the regular (non-system-container)
+	// Sysbox path, and its CNI helper still executes /proc/self/exe.
+	// Sysbox containers are the explicit PoC boundary for nested K3s. CRI
+	// v2 may drop the annotation before OCI conversion, so apply the proc
+	// execution requirement at the final Sysbox mount stage.
+	cfgProcExec(spec, true)
 
 	sortMounts(spec, hasSystemd)
 
@@ -775,20 +792,45 @@ func cfgSyscontMounts(sysMgr *sysbox.Mgr, spec *specs.Spec) {
 		return
 	}
 
-	// Add sysbox's default syscont mounts
-	spec.Mounts = append(spec.Mounts, syscontMounts...)
+	// Add sysbox's default syscont mounts. The proc-exec opt-in must be
+	// applied to this source list before it is appended; later conversion
+	// paths may retain the appended mount slice and bypass a post-pass.
+	mounts := append([]specs.Mount(nil), syscontMounts...)
+	if spec.Annotations != nil && spec.Annotations[allowProcExecAnnotation] == "true" {
+		for i := range mounts {
+			if filepath.Clean(mounts[i].Destination) == "/proc" && mounts[i].Type == "proc" {
+				mounts[i].Options = utils.StringSliceRemove(mounts[i].Options, []string{"noexec"})
+			}
+		}
+	}
+	spec.Mounts = append(spec.Mounts, mounts...)
 }
 
 // cfgProcExec permits executable procfs only for an explicitly opted-in
 // nested-K3s experiment. Its CNI namespace helper executes /proc/self/exe.
-func cfgProcExec(spec *specs.Spec) {
-	if spec.Annotations == nil || spec.Annotations[allowProcExecAnnotation] != "true" {
+func cfgProcExec(spec *specs.Spec, syscontMode bool) {
+	annotationEnabled := spec.Annotations != nil && spec.Annotations[allowProcExecAnnotation] == "true"
+	// The nested runtime wrapper is launched by an inner containerd whose
+	// sandbox annotation forwarding is not guaranteed. Keep the escape hatch
+	// explicit and scoped to that wrapper's process environment.
+	envEnabled := os.Getenv("SYSBOX_ALLOW_PROC_EXEC") == "true"
+	if !annotationEnabled && !envEnabled && !syscontMode {
 		return
 	}
+	foundProc := false
 	for i := range spec.Mounts {
-		if filepath.Clean(spec.Mounts[i].Destination) == "/proc" && spec.Mounts[i].Type == "proc" {
+		if filepath.Clean(spec.Mounts[i].Destination) == "/proc" {
+			foundProc = true
 			spec.Mounts[i].Options = utils.StringSliceRemove(spec.Mounts[i].Options, []string{"noexec"})
 		}
+	}
+	if !foundProc {
+		spec.Mounts = append(spec.Mounts, specs.Mount{
+			Destination: "/proc",
+			Type:        "proc",
+			Source:      "proc",
+			Options:     []string{"nosuid", "nodev"},
+		})
 	}
 }
 

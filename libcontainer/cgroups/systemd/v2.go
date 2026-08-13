@@ -517,6 +517,9 @@ func (m *unifiedManager) Exists() bool {
 }
 
 func (m *unifiedManager) CreateChildCgroup(config *configs.Config) error {
+	if config != nil && config.NestedIdentity && !cgroups.IsCgroup2UnifiedMode() {
+		return fmt.Errorf("nested-identity cgroup delegation requires cgroup v2")
+	}
 
 	// Change the cgroup ownership to match the root user in the system
 	// container (needed for delegation).
@@ -612,6 +615,9 @@ func (m *unifiedManager) CreateChildCgroup(config *configs.Config) error {
 }
 
 func (m *unifiedManager) ApplyChildCgroup(pid int) error {
+	if m.cgroups.NestedIdentity && !cgroups.IsCgroup2UnifiedMode() {
+		return fmt.Errorf("nested-identity cgroup delegation requires cgroup v2")
+	}
 	if m.cgroups.NestedIdentity && m.nestedStage == 0 {
 		m.nestedStage++
 		return cgroups.EnterPid(map[string]string{"": filepath.Join(m.path, "sysbox.delegate")}, pid)

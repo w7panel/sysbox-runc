@@ -36,7 +36,10 @@ type linuxStandardInit struct {
 // is not registered yet and direct mounts from the nested userns fail EPERM.
 func mountNestedSpecialFilesystems(config *configs.Config) error {
 	for _, m := range config.Mounts {
-		if m.Device != "proc" && m.Device != "sysfs" {
+		// procfs was mounted at the start of prepareRootfs because runc's
+		// procfd mount helpers require it. sysfs remains delayed until sysbox-fs
+		// registration has completed.
+		if m.Device != "sysfs" {
 			continue
 		}
 
@@ -65,6 +68,7 @@ const (
 	rootfsIDMap
 	overlay
 	sysfs
+	procfs
 )
 
 type opReq struct {

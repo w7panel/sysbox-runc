@@ -181,8 +181,35 @@ done:
 /* XXX: This is ugly. */
 static int syncfd = -1;
 
+/* The inner runtime deliberately runs in a user namespace where the normal
+ * runc log pipe may not be available yet.  Keep a small opt-in diagnostic
+ * breadcrumb on the L1 filesystem so failures before the bootstrap protocol
+ * can still be diagnosed. */
+static void nested_trace(const char *fmt, ...)
+{
+	const char *path = getenv("_SYSBOX_NESTED_TRACE");
+	if (path == NULL || *path == '\0')
+		return;
+	int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+	if (fd < 0)
+		return;
+	char message[1024] = {};
+	va_list args;
+	va_start(args, fmt);
+	int n = vsnprintf(message, sizeof(message), fmt, args);
+	va_end(args);
+	if (n > 0) {
+		if (n > (int)sizeof(message) - 2)
+			n = sizeof(message) - 2;
+		message[n++] = '\n';
+		(void)write(fd, message, n);
+	}
+	close(fd);
+}
+
 #define bail(fmt, ...)                                       \
 	do {                                                       \
+		nested_trace("%s:%d: " fmt ": %s", __FUNCTION__, __LINE__, ##__VA_ARGS__, strerror(errno)); \
 		write_log(FATAL, "nsenter: " fmt ": %m", ##__VA_ARGS__); \
 		exit(1);                                                 \
 	} while(0)
