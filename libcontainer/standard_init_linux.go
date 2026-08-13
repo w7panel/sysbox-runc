@@ -10,6 +10,7 @@ import (
 	sysboxmount "github.com/nestybox/sysbox-libs/mount"
 	"github.com/opencontainers/runc/internals/pathrs"
 	"github.com/opencontainers/runc/libcontainer/apparmor"
+	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/keys"
 	"github.com/opencontainers/runc/libcontainer/seccomp"
@@ -35,6 +36,8 @@ type linuxStandardInit struct {
 // namespaces. Doing this during prepareRootfs is too early: the L2 container
 // is not registered yet and direct mounts from the nested userns fail EPERM.
 func mountNestedSpecialFilesystems(config *configs.Config) error {
+	// Install sysfs first. The cgroup2 mountpoint lives below it and would be
+	// hidden if the order were reversed.
 	for _, m := range config.Mounts {
 		// procfs was mounted at the start of prepareRootfs because runc's
 		// procfd mount helpers require it. sysfs remains delayed until sysbox-fs
@@ -50,6 +53,21 @@ func mountNestedSpecialFilesystems(config *configs.Config) error {
 		for _, pflag := range m.PropagationFlags {
 			if err := unix.Mount("", dest, "", uintptr(pflag), ""); err != nil {
 				return errors.Wrapf(err, "set nested %s propagation at %s", m.Device, dest)
+			}
+		}
+	}
+	for _, m := range config.Mounts {
+		if m.Device != "cgroup" || !cgroups.IsCgroup2UnifiedMode() {
+			continue
+		}
+
+		dest := "/" + strings.TrimPrefix(m.Destination, "/")
+		if err := mountFilesystemAtPath(dest, "cgroup2", m.Flags, m.Data); err != nil {
+			return errors.Wrapf(err, "mount nested cgroup2 at %s", dest)
+		}
+		for _, pflag := range m.PropagationFlags {
+			if err := setMountPropagationAtPath(dest, pflag); err != nil {
+				return errors.Wrapf(err, "set nested cgroup2 propagation at %s", dest)
 			}
 		}
 	}
@@ -80,6 +98,7 @@ type opReq struct {
 	Rootfs            string    `json:"rootfs"`
 	FsuidMapFailOnErr bool      `json:"fsuid_map_fail_on_err"`
 	SkipSpecialMounts bool      `json:"skip_special_mounts"`
+	NestedIdentity    bool      `json:"nested_identity"`
 
 	// bind
 	Mount configs.Mount `json:"mount"`
@@ -249,7 +268,7 @@ func (l *linuxStandardInit) Init() error {
 	}
 
 	// Handle masked paths
-	if err := maskPaths(l.config.Config.MaskPaths, l.config.Config.MountLabel); err != nil {
+	if err := maskPaths(l.config.Config.MaskPaths, l.config.Config.MountLabel, l.config.Config.NestedIdentity); err != nil {
 		return err
 	}
 

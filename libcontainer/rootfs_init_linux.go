@@ -82,7 +82,7 @@ func iptablesRestoreHasWait() (bool, error) {
 	return verConstraint.Check(ver), nil
 }
 
-func doBindMount(rootfs string, m *configs.Mount) error {
+func doBindMount(rootfs string, m *configs.Mount, nestedIdentity bool) error {
 
 	// sysbox-runc: For some reason, when the rootfs is on shiftfs, we need to do
 	// an Lstat() of the source path prior to doing the mount. Otherwise we get a
@@ -96,6 +96,18 @@ func doBindMount(rootfs string, m *configs.Mount) error {
 		src = filepath.Dir(m.Source)
 	}
 	os.Lstat(src)
+
+	if nestedIdentity {
+		if err := cloneMountAtPath(m.Source, m.Destination); err != nil {
+			return fmt.Errorf("clone bind mount of %s -> %s: %w", m.Source, m.Destination, err)
+		}
+		for _, pflag := range m.PropagationFlags {
+			if err := setMountPropagationAtPath(m.Destination, pflag); err != nil {
+				return fmt.Errorf("change cloned bind mount propagation: %w", err)
+			}
+		}
+		return nil
+	}
 
 	// Bind-mount with procfd to mitigate symlink exchange attacks.
 	if err := libcontainerUtils.WithProcfd(rootfs, m.Destination, func(procfd string) error {
@@ -130,6 +142,25 @@ func doBindMount(rootfs string, m *configs.Mount) error {
 		return fmt.Errorf("change bind mount propagation through procfd: %w", err)
 	}
 
+	return nil
+}
+
+func cloneMountAtPath(source, target string) error {
+	targetFd, err := unix.Open(target, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open bind target %q: %w", target, err)
+	}
+	defer unix.Close(targetFd)
+
+	mountFd, err := unix.OpenTree(unix.AT_FDCWD, source, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
+	if err != nil {
+		return fmt.Errorf("open_tree bind source %q: %w", source, err)
+	}
+	defer unix.Close(mountFd)
+
+	if err := unix.MoveMount(mountFd, "", targetFd, "", unix.MOVE_MOUNT_F_EMPTY_PATH|unix.MOVE_MOUNT_T_EMPTY_PATH); err != nil {
+		return fmt.Errorf("move_mount bind source %q to %q: %w", source, target, err)
+	}
 	return nil
 }
 
@@ -500,7 +531,7 @@ func (l *linuxRootfsInit) Init() error {
 			m := &req.Mount
 			mountLabel := req.Label
 
-			if err := doBindMount(rootfs, m); err != nil {
+			if err := doBindMount(rootfs, m, l.reqs[0].NestedIdentity); err != nil {
 				return newSystemErrorWithCausef(err, "bind mounting %s to %s", m.Source, m.Destination)
 			}
 
@@ -508,7 +539,13 @@ func (l *linuxRootfsInit) Init() error {
 			// first check that we have non-default options required before attempting a remount
 			if m.Flags&^(unix.MS_REC|unix.MS_REMOUNT|unix.MS_BIND) != 0 {
 				// only remount if unique mount options are set
-				if err := remount(m); err != nil {
+				var err error
+				if l.reqs[0].NestedIdentity {
+					err = setMountAttrsAtPath(m.Destination, m.Flags)
+				} else {
+					err = remount(m)
+				}
+				if err != nil {
 					return newSystemErrorWithCausef(err, "remount of %s with flags %#x",
 						m.Destination, m.Flags)
 				}
