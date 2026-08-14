@@ -300,6 +300,35 @@ func TestNestedIdentitySkipsCgroupDeviceFilter(t *testing.T) {
 	}
 }
 
+func TestNestedNetworkSandbox(t *testing.T) {
+	sandbox := &specs.Spec{
+		Annotations: map[string]string{"io.kubernetes.cri.container-type": "sandbox"},
+		Linux: &specs.Linux{Namespaces: []specs.LinuxNamespace{
+			{Type: specs.NetworkNamespace, Path: "/var/run/netns/cni-test"},
+		}},
+	}
+	if !nestedNetworkSandbox(sandbox, true) {
+		t.Fatal("nested CRI sandbox did not request a child-owned network namespace")
+	}
+
+	workload := &specs.Spec{
+		Annotations: map[string]string{"io.kubernetes.cri.container-type": "container"},
+		Linux: &specs.Linux{Namespaces: []specs.LinuxNamespace{
+			{Type: specs.NetworkNamespace, Path: "/proc/123/ns/net"},
+		}},
+	}
+	if nestedNetworkSandbox(workload, true) {
+		t.Fatal("nested workload container must join the sandbox network namespace")
+	}
+	if nestedNetworkSandbox(sandbox, false) {
+		t.Fatal("standard Sysbox sandbox unexpectedly requested nested networking")
+	}
+	sandbox.Linux.Namespaces[0].Path = "/var/run/netns/../host"
+	if nestedNetworkSandbox(sandbox, true) {
+		t.Fatal("nested sandbox accepted a network namespace outside the managed directory")
+	}
+}
+
 func TestLinuxCgroupSystemd(t *testing.T) {
 	cgroupsPath := "parent:scopeprefix:name"
 

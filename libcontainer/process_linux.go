@@ -477,6 +477,12 @@ func (p *initProcess) start() (retErr error) {
 		return newSystemErrorWithCause(err, "waiting for our first child to exit")
 	}
 
+	if p.config.Config.NestedNetwork {
+		if err := setupNestedNetwork(p.config.Config.Namespaces.PathOf(configs.NEWNET), childPid); err != nil {
+			return newSystemErrorWithCause(err, "setting up nested network namespace")
+		}
+	}
+
 	if err := p.createNetworkInterfaces(); err != nil {
 		return newSystemErrorWithCause(err, "creating network interfaces")
 	}

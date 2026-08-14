@@ -30,6 +30,7 @@ const (
 	ParentMountAttr    uint16 = 27294
 	ShiftfsMountsAttr  uint16 = 27295
 	TimeOffsetsAttr    uint16 = 27296
+	NestedNetworkAttr  uint16 = 27297
 )
 
 type Int32msg struct {

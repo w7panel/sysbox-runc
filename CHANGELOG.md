@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- Add the experimental `sysbox-runc-inner` nested path: it skips unavailable
-  special mounts, preserves the exec FIFO handshake without `/proc`, and uses
-  a 65,535-ID mapping. This lets a Sysbox K3s Pod run a pause Pod through a
-  second Sysbox runtime while preserving parent ID 0 as an isolation boundary.
+- Add the experimental `nested-identity` path for `sysbox-runc-inner`. It
+  always creates a child user namespace with `0:0:65536`, uses NoShift for
+  rootfs and bind mounts, and migrates CRI CNI links into a child-owned netns.
+  The migrated namespace restores addresses and routes, enables loopback, and
+  rebinds the persistent CNI handle so sandbox and workload containers share
+  the same child userns and netns.

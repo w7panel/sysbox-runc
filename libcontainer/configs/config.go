@@ -128,6 +128,10 @@ type Config struct {
 	// (non-initial) user namespace.
 	NestedIdentity bool `json:"nested_identity"`
 
+	// NestedNetwork requests a child-userns-owned network namespace for a CRI
+	// sandbox whose CNI namespace was created in the parent user namespace.
+	NestedNetwork bool `json:"nested_network"`
+
 	// Hostname optionally sets the container's hostname if provided
 	Hostname string `json:"hostname"`
 

@@ -385,6 +385,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		// setting into initConfig for the child init process.
 		SkipSpecialMounts: spec.Annotations["sysbox/skip-special-mounts"] == "true" || os.Getenv("SYSBOX_SKIP_SPECIAL_MOUNTS") == "true" || opts.NestedIdentity,
 		NestedIdentity:    opts.NestedIdentity,
+		NestedNetwork:     nestedNetworkSandbox(spec, opts.NestedIdentity),
 	}
 
 	for _, m := range spec.Mounts {
@@ -493,6 +494,30 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 	createHooks(spec, config)
 	config.Version = specs.Version
 	return config, nil
+}
+
+func nestedNetworkSandbox(spec *specs.Spec, nestedIdentity bool) bool {
+	if !nestedIdentity || spec.Annotations["io.kubernetes.cri.container-type"] != "sandbox" || spec.Linux == nil {
+		return false
+	}
+	for _, ns := range spec.Linux.Namespaces {
+		if ns.Type != specs.NetworkNamespace || ns.Path == "" {
+			continue
+		}
+		path := filepath.Clean(ns.Path)
+		return nestedNetnsPath(path)
+	}
+	return false
+}
+
+func nestedNetnsPath(path string) bool {
+	for _, prefix := range []string{"/run/netns", "/var/run/netns"} {
+		rel, err := filepath.Rel(prefix, path)
+		if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func createLibcontainerMount(cwd string, m specs.Mount) (*configs.Mount, error) {

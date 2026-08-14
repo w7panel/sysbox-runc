@@ -84,6 +84,7 @@ struct nlconfig_t {
 
 	/* Rootless container settings. */
 	uint8_t is_rootless_euid;	/* boolean */
+	uint8_t nested_network; /* boolean */
 	char *uidmappath;
 	size_t uidmappath_len;
 	char *gidmappath;
@@ -135,6 +136,7 @@ static int logfd = -1;
 #define PARENT_MOUNT_ATTR  27294
 #define SHIFTFS_MOUNTS_ATTR 27295
 #define TIMENSOFFSET_ATTR   27296
+#define NESTED_NETWORK_ATTR 27297
 
 /*
  * Use the raw syscall for versions of glibc which don't include a function for
@@ -607,6 +609,9 @@ static void nl_parse(int fd, struct nlconfig_t *config)
 		case TIMENSOFFSET_ATTR:
 			config->timensoffset = current;
 			config->timensoffset_len = payload_len;
+			break;
+		case NESTED_NETWORK_ATTR:
+			config->nested_network = readint8(current);
 			break;
 		default:
 			bail("unknown netlink message type %d", nlattr->nla_type);
@@ -1143,6 +1148,17 @@ void nsexec(void)
 
 				if (mount(".", ".", "bind", MS_BIND|MS_REC, "") < 0)
 					bail("failed to create bind-to-self mount on rootfs.");
+			}
+
+			/*
+			 * CNI creates the sandbox netns before runc creates the child
+			 * userns. Create the working netns after the child mapping is set;
+			 * the L1 runc parent migrates the CNI interfaces into it.
+			 */
+			if (config.nested_network) {
+				if (!new_userns)
+					bail("nested network requires a new user namespace");
+				config.cloneflags |= CLONE_NEWNET;
 			}
 
 			if (config.prep_rootfs && !shiftfs_mounts_done) {

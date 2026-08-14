@@ -2341,6 +2341,10 @@ func (c *linuxContainer) bootstrapData(cloneFlags uintptr, nsMaps map[configs.Na
 		Type:  RootlessEUIDAttr,
 		Value: c.config.RootlessEUID,
 	})
+	r.AddData(&Boolmsg{
+		Type:  NestedNetworkAttr,
+		Value: c.config.NestedNetwork,
+	})
 
 	// sysbox-runc: request prep of the rootfs when we create a new mnt-ns
 	_, joinExistingMnt := nsMaps[configs.NEWNS]
