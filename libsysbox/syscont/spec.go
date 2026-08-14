@@ -1131,13 +1131,11 @@ func isCRIImageVolumeMount(m specs.Mount) bool {
 // /var/lib/docker, /var/lib/kubelet, etc. in order to enable system software to
 // run in the container seamlessly).
 func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
-	if sysbox.Mgr.Config.MappingMode == ipcLib.NestedIdentity {
-		return nil
-	}
 	// Kubernetes CRI does not preserve arbitrary OCI annotations reliably. The
-	// dedicated nested runtime therefore conveys this mode through its wrapper
-	// environment; avoid creating Sysbox's host-backed special directories in
-	// either form.
+	// dedicated nested runtime therefore conveys explicit opt-outs through its
+	// wrapper environment. Nested-identity itself must retain Sysbox's implicit
+	// special-directory mounts: with NoShift these are safe identity bind mounts,
+	// and they keep Docker's overlay upper/work directories off the FUSE rootfs.
 	if (spec.Annotations != nil && spec.Annotations[skipSpecialMountsAnnotation] == "true") ||
 		os.Getenv("SYSBOX_SKIP_SPECIAL_MOUNTS") == "true" {
 		return nil

@@ -343,6 +343,7 @@ var syscontSyscallWhitelist = []string{
 	"arch_prctl",
 	"modify_ldt",
 	"clone",
+	"clone3",
 	"chroot",
 
 	// docker blocks these by default; sysbox-runc allows them
