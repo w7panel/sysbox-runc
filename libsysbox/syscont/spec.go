@@ -132,24 +132,6 @@ var SysboxfsMounts = []specs.Mount{
 		Options:     []string{"rbind", "rprivate"},
 	},
 	specs.Mount{
-		Destination: "/proc/pressure/io",
-		Source:      filepath.Join(SysboxFsDir, "proc/pressure/io"),
-		Type:        "bind",
-		Options:     []string{"rbind", "rprivate"},
-	},
-	specs.Mount{
-		Destination: "/proc/pressure/cpu",
-		Source:      filepath.Join(SysboxFsDir, "proc/pressure/cpu"),
-		Type:        "bind",
-		Options:     []string{"rbind", "rprivate"},
-	},
-	specs.Mount{
-		Destination: "/proc/pressure/memory",
-		Source:      filepath.Join(SysboxFsDir, "proc/pressure/memory"),
-		Type:        "bind",
-		Options:     []string{"rbind", "rprivate"},
-	},
-	specs.Mount{
 		Destination: "/proc/sys",
 		Source:      filepath.Join(SysboxFsDir, "proc/sys"),
 		Type:        "bind",
@@ -231,6 +213,27 @@ var SysboxfsMounts = []specs.Mount{
 	specs.Mount{
 		Destination: "/sys/module/nf_conntrack/parameters",
 		Source:      filepath.Join(SysboxFsDir, "sys/module/nf_conntrack/parameters"),
+		Type:        "bind",
+		Options:     []string{"rbind", "rprivate"},
+	},
+}
+
+var sysboxfsPressureMounts = []specs.Mount{
+	{
+		Destination: "/proc/pressure/io",
+		Source:      filepath.Join(SysboxFsDir, "proc/pressure/io"),
+		Type:        "bind",
+		Options:     []string{"rbind", "rprivate"},
+	},
+	{
+		Destination: "/proc/pressure/cpu",
+		Source:      filepath.Join(SysboxFsDir, "proc/pressure/cpu"),
+		Type:        "bind",
+		Options:     []string{"rbind", "rprivate"},
+	},
+	{
+		Destination: "/proc/pressure/memory",
+		Source:      filepath.Join(SysboxFsDir, "proc/pressure/memory"),
 		Type:        "bind",
 		Options:     []string{"rbind", "rprivate"},
 	},
@@ -817,18 +820,24 @@ func cfgSyscontMountsReadOnly(sysMgr *sysbox.Mgr, spec *specs.Spec) {
 
 // cfgSysboxfsMounts adds the sysbox-fs mounts to the container's config.
 func cfgSysboxfsMounts(spec *specs.Spec, sysFs *sysbox.Fs) {
+	mounts := append([]specs.Mount{}, SysboxfsMounts...)
+	allMounts := append(append([]specs.Mount{}, mounts...), sysboxfsPressureMounts...)
 
-	spec.Mounts = utils.MountSliceRemove(spec.Mounts, SysboxfsMounts, func(m1, m2 specs.Mount) bool {
+	if mountProcPressure() {
+		mounts = append(mounts, sysboxfsPressureMounts...)
+	}
+
+	spec.Mounts = utils.MountSliceRemove(spec.Mounts, allMounts, func(m1, m2 specs.Mount) bool {
 		return m1.Destination == m2.Destination
 	})
 
 	// Adjust SysboxfsMounts path attending to container-id value.
 	cntrMountpoint := filepath.Join(sysFs.Mountpoint, sysFs.Id)
 
-	for i := range SysboxfsMounts {
-		SysboxfsMounts[i].Source =
+	for i := range mounts {
+		mounts[i].Source =
 			strings.Replace(
-				SysboxfsMounts[i].Source,
+				mounts[i].Source,
 				SysboxFsDir,
 				cntrMountpoint,
 				1,
@@ -846,12 +855,42 @@ func cfgSysboxfsMounts(spec *specs.Spec, sysFs *sysbox.Fs) {
 	// remounted to read-only after the container setup completes, right before
 	// starting the container's init process.
 	if spec.Root.Readonly {
-		for _, m := range SysboxfsMounts {
+		for _, m := range mounts {
 			spec.Linux.ReadonlyPaths = append(spec.Linux.ReadonlyPaths, m.Destination)
 		}
 	}
 
-	spec.Mounts = append(spec.Mounts, SysboxfsMounts...)
+	spec.Mounts = append(spec.Mounts, mounts...)
+}
+
+func mountProcPressure() bool {
+	return mountProcPressureFromFile("/etc/os-release")
+}
+
+func mountProcPressureFromFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+
+	var distro, version string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		key, value, ok := strings.Cut(scanner.Text(), "=")
+		if !ok {
+			continue
+		}
+		value = strings.Trim(value, "\"'")
+		switch key {
+		case "ID":
+			distro = value
+		case "VERSION_ID":
+			version = value
+		}
+	}
+
+	return distro != "centos" || !strings.HasPrefix(version, "9")
 }
 
 // cfgSystemdMounts adds systemd related mounts to the spec
