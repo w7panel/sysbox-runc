@@ -241,9 +241,19 @@ func TestGetSpecialDirsUsesCustomK3sDataDir(t *testing.T) {
 }
 
 func TestValidatePersistentSpecialIDMapMountFailsWithoutIDMapMode(t *testing.T) {
-	err := validatePersistentSpecialIDMapMount(sh.Shiftfs, specs.Mount{Source: t.TempDir(), Destination: "/srv/custom"})
+	err := validatePersistentSpecialIDMapMount(sh.Shiftfs, ipcLib.StandardSubid, specs.Mount{Source: t.TempDir(), Destination: "/srv/custom"})
 	if err == nil {
 		t.Fatal("persistent custom special path must fail without idmapped mount mode")
+	}
+}
+
+func TestValidatePersistentSpecialNoShiftRequiresNestedIdentity(t *testing.T) {
+	mount := specs.Mount{Source: t.TempDir(), Destination: "/srv/custom"}
+	if err := validatePersistentSpecialIDMapMount(sh.NoShift, ipcLib.StandardSubid, mount); err == nil {
+		t.Fatal("standard subid persistent special mount accepted NoShift")
+	}
+	if err := validatePersistentSpecialIDMapMount(sh.NoShift, ipcLib.NestedIdentity, mount); err != nil {
+		t.Fatalf("nested identity persistent special mount rejected NoShift: %v", err)
 	}
 }
 

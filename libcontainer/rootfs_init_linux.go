@@ -32,6 +32,25 @@ type linuxRootfsInit struct {
 	reqs []opReq
 }
 
+type newMountAPI func(target, fsType string, flags int, data string) error
+type legacyMountAPI func(source, target, fsType string, flags uintptr, data string) error
+
+// mountNestedProcfs prefers the new mount API, which avoids the inherited
+// mount(2) seccomp-notify path at deeper nesting levels. Some outer Sysbox
+// policies reject fsmount(2), so fall back to mount(2) only for EPERM.
+func mountNestedProcfs(m *configs.Mount, dest string, newMount newMountAPI, legacyMount legacyMountAPI) error {
+	flags := m.Flags &^ unix.MS_NOEXEC
+	if err := newMount(dest, m.Device, flags, m.Data); err != nil {
+		if !errors.Is(err, unix.EPERM) {
+			return err
+		}
+		if legacyErr := legacyMount(m.Source, dest, m.Device, uintptr(flags), m.Data); legacyErr != nil {
+			return fmt.Errorf("new mount API failed: %v; mount(2) fallback failed: %w", err, legacyErr)
+		}
+	}
+	return nil
+}
+
 // getDir returns the path to the directory that contains the file at the given path
 func getDir(file string) (string, error) {
 	fi, err := os.Stat(file)
@@ -629,8 +648,7 @@ func (l *linuxRootfsInit) Init() error {
 		if err := os.MkdirAll(dest, 0755); err != nil {
 			return newSystemErrorWithCause(err, "creating nested procfs destination")
 		}
-		flags := uintptr(m.Flags) &^ uintptr(unix.MS_NOEXEC)
-		if err := unix.Mount(m.Source, dest, m.Device, flags, m.Data); err != nil {
+		if err := mountNestedProcfs(m, dest, mountFilesystemAtPath, unix.Mount); err != nil {
 			return newSystemErrorWithCausef(err, "mounting nested procfs at %s", dest)
 		}
 

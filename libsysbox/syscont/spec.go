@@ -1168,7 +1168,7 @@ func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
 
 		if m.Type == "bind" {
 			if source, persistent := persistentSpecialMounts[filepath.Clean(m.Destination)]; persistent && filepath.Clean(m.Source) == filepath.Clean(source) {
-				if err := validatePersistentSpecialIDMapMount(sysbox.BindMntUidShiftType, m); err != nil {
+				if err := validatePersistentSpecialIDMapMount(sysbox.BindMntUidShiftType, mgr.Config.MappingMode, m); err != nil {
 					return err
 				}
 				delete(specialDirMap, m.Destination)
@@ -1247,7 +1247,10 @@ func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
 	return nil
 }
 
-func validatePersistentSpecialIDMapMount(shiftType sh.IDShiftType, mount specs.Mount) error {
+func validatePersistentSpecialIDMapMount(shiftType sh.IDShiftType, mappingMode ipcLib.MappingMode, mount specs.Mount) error {
+	if mappingMode == ipcLib.NestedIdentity && shiftType == sh.NoShift {
+		return nil
+	}
 	if shiftType != sh.IDMappedMount && shiftType != sh.IDMappedMountOrShiftfs {
 		return fmt.Errorf("persistent special mount %s requires idmapped mounts", mount.Destination)
 	}

@@ -236,7 +236,7 @@ func (l *linuxStandardInit) Init() error {
 	// A nested command-mode system container has no mountable procfs/sysfs.
 	// Its kernel settings belong to the outer K3s Pod, so do not attempt to
 	// apply OCI sysctls through paths that deliberately do not exist.
-	if !l.config.Config.SkipSpecialMounts {
+	if !l.config.Config.SkipSpecialMounts && !l.config.Config.NestedIdentity {
 		for key, value := range l.config.Config.Sysctl {
 			if err := writeSystemProperty(key, value); err != nil {
 				return errors.Wrapf(err, "write sysctl key %s", key)
