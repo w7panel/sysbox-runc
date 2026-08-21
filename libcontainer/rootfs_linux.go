@@ -1411,7 +1411,7 @@ func mountPropagate(m *configs.Mount, rootfs string, mountLabel string, nestedId
 	// mounts and attach them by target fd instead. This is required for both
 	// the /dev tmpfs and its devpts and mqueue child mounts.
 	if nestedIdentity && (m.Device == "tmpfs" || m.Device == "mqueue" || m.Device == "devpts") {
-		if err := mountFilesystemAtPath(m.Destination, m.Device, flags, data); err != nil {
+		if err := mountNestedFilesystem(m, flags, data, mountFilesystemAtPath, unix.Mount); err != nil {
 			return fmt.Errorf("mount nested %s with new mount API: %w", m.Device, err)
 		}
 		for _, pflag := range m.PropagationFlags {
@@ -1438,6 +1438,22 @@ func mountPropagate(m *configs.Mount, rootfs string, mountLabel string, nestedId
 		return nil
 	}); err != nil {
 		return fmt.Errorf("change mount propagation through procfd: %w", err)
+	}
+	return nil
+}
+
+// mountNestedFilesystem prefers fd-based mounts, which avoid resolving the
+// target through the outer container's procfs. Some outer Sysbox seccomp
+// policies reject fsconfig(FSCONFIG_CMD_CREATE), so retry mount(2) only for
+// EPERM; all other new-mount failures remain fatal.
+func mountNestedFilesystem(m *configs.Mount, flags int, data string, newMount newMountAPI, legacyMount legacyMountAPI) error {
+	if err := newMount(m.Destination, m.Device, flags, data); err != nil {
+		if !errors.Is(err, unix.EPERM) {
+			return err
+		}
+		if legacyErr := legacyMount(m.Source, m.Destination, m.Device, uintptr(flags), data); legacyErr != nil {
+			return fmt.Errorf("new mount API failed: %v; mount(2) fallback failed: %w", err, legacyErr)
+		}
 	}
 	return nil
 }

@@ -61,6 +61,56 @@ func TestMountNestedProcfs(t *testing.T) {
 	}
 }
 
+func TestMountNestedFilesystem(t *testing.T) {
+	tests := []struct {
+		name            string
+		newMountErr     error
+		legacyMountErr  error
+		wantErr         error
+		wantLegacyCalls int
+	}{
+		{name: "new mount API succeeds"},
+		{name: "EPERM falls back", newMountErr: unix.EPERM, wantLegacyCalls: 1},
+		{name: "other error does not fall back", newMountErr: unix.EINVAL, wantErr: unix.EINVAL},
+		{name: "fallback error is returned", newMountErr: unix.EPERM, legacyMountErr: unix.EACCES, wantErr: unix.EACCES, wantLegacyCalls: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			legacyCalls := 0
+			m := &configs.Mount{
+				Source:      "mqueue",
+				Destination: "/dev/mqueue",
+				Device:      "mqueue",
+			}
+			err := mountNestedFilesystem(
+				m,
+				unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC,
+				"mode=1777",
+				func(target, fsType string, flags int, data string) error {
+					if target != "/dev/mqueue" || fsType != "mqueue" || flags != unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC || data != "mode=1777" {
+						t.Fatalf("unexpected new mount arguments: target=%q fsType=%q flags=%#x data=%q", target, fsType, flags, data)
+					}
+					return tt.newMountErr
+				},
+				func(source, target, fsType string, flags uintptr, data string) error {
+					legacyCalls++
+					if source != "mqueue" || target != "/dev/mqueue" || fsType != "mqueue" || flags != unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC || data != "mode=1777" {
+						t.Fatalf("unexpected legacy mount arguments: source=%q target=%q fsType=%q flags=%#x data=%q", source, target, fsType, flags, data)
+					}
+					return tt.legacyMountErr
+				},
+			)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("mountNestedFilesystem() error = %v, want %v", err, tt.wantErr)
+			}
+			if legacyCalls != tt.wantLegacyCalls {
+				t.Fatalf("legacy mount calls = %d, want %d", legacyCalls, tt.wantLegacyCalls)
+			}
+		})
+	}
+}
+
 func TestNeedsSetupDev(t *testing.T) {
 	config := &configs.Config{
 		Mounts: []*configs.Mount{
