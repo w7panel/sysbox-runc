@@ -1,5 +1,10 @@
 # Changelog
 
+- Fix nested-identity interactive exec hanging before terminal attachment. The
+  setns process now closes runtime-only synchronization descriptors before
+  exec even when special mounts are skipped, preventing a long-running shell
+  from keeping the parent runc synchronization socket open indefinitely.
+
 ## Unreleased
 
 - Add the experimental `nested-identity` path for `sysbox-runc-inner`. It

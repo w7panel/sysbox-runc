@@ -81,6 +81,15 @@ type initer interface {
 	Init() error
 }
 
+// shouldCloseInternalFds reports whether the final init stage can use its
+// private procfs to remove runtime-only file descriptors before exec. Legacy
+// skip-special-mounts containers may have no procfs, but nested-identity
+// containers always mount one and must not leak the init synchronization
+// socket into long-running exec processes.
+func shouldCloseInternalFds(config *configs.Config) bool {
+	return !config.SkipSpecialMounts || config.NestedIdentity
+}
+
 func newContainerInit(t initType, pipe *os.File, consoleSocket, fifoFile *os.File) (initer, error) {
 	if t == initStandard || t == initSetns {
 		var config *initConfig
@@ -175,7 +184,7 @@ func finalizeNamespace(config *initConfig) error {
 	// XXX: CloseExecFrom relies on the presence procfs being mounted inside the sys container.
 	// This means a setns entry into the sys container (e.g., via docker exec) would fail if
 	// /proc is not mounted in the container.
-	if !config.Config.SkipSpecialMounts {
+	if shouldCloseInternalFds(config.Config) {
 		if err := utils.CloseExecFrom(config.PassedFilesCount + 3); err != nil {
 			return errors.Wrap(err, "close exec fds")
 		}

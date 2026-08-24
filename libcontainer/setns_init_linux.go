@@ -126,7 +126,7 @@ func (l *linuxSetnsInit) Init() error {
 	// (otherwise the (*os.File) finaliser could close the wrong file). See
 	// runc CVE-2024-21626 for more information as to why this protection is
 	// necessary.
-	if !l.config.Config.SkipSpecialMounts {
+	if shouldCloseInternalFds(l.config.Config) {
 		if err := utils.UnsafeCloseFrom(l.config.PassedFilesCount + 3); err != nil {
 			return err
 		}
