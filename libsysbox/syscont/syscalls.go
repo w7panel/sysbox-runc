@@ -197,9 +197,12 @@ var syscontSyscallWhitelist = []string{
 	"pause",
 	"pipe",
 	"pipe2",
+	"pidfd_open",
+	"pidfd_send_signal",
 	"poll",
 	"ppoll",
 	"prctl",
+	"ptrace",
 	"pread64",
 	"preadv",
 	"preadv2",
@@ -343,6 +346,8 @@ var syscontSyscallWhitelist = []string{
 	"arch_prctl",
 	"modify_ldt",
 	"clone",
+	// modern runc prefers clone3() when creating nested containers
+	"clone3",
 	"chroot",
 
 	// docker blocks these by default; sysbox-runc allows them

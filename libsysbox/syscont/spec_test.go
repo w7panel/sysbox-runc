@@ -65,6 +65,19 @@ func genSeccompWhitelist(syscalls []string) []specs.LinuxSyscall {
 	return specSyscalls
 }
 
+func TestNestedRuntimeSyscallsAllowed(t *testing.T) {
+	seccomp := &specs.LinuxSeccomp{
+		Architectures: []specs.Arch{specs.ArchX86_64},
+		DefaultAction: specs.ActErrno,
+		Syscalls:      genSeccompWhitelist(syscontSyscallWhitelist),
+	}
+	for _, name := range []string{"clone", "clone3", "setns", "unshare"} {
+		if ok, _ := findSeccompSyscall(seccomp, []string{name}); !ok {
+			t.Errorf("nested runtime syscall %q is not whitelisted", name)
+		}
+	}
+}
+
 func TestNegativeTimeOffset(t *testing.T) {
 	offset, err := negativeTimeOffset("123.45")
 	if err != nil {
