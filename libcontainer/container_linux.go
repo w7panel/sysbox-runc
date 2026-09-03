@@ -281,7 +281,7 @@ func (c *linuxContainer) Start(process *Process) error {
 
 	config := c.config
 
-	if config.Cgroups.Resources.SkipDevices {
+	if config.Cgroups.Resources.SkipDevices && !config.NestedIdentity {
 		return newGenericError(errors.New("can't start container with SkipDevices set"), ConfigInvalid)
 	}
 
@@ -566,7 +566,13 @@ func (c *linuxContainer) deleteExecFifo() {
 // fd, with _LIBCONTAINER_FIFOFD set to its fd number.
 func (c *linuxContainer) includeExecFifo(cmd *exec.Cmd) error {
 	fifoName := filepath.Join(c.root, execFifoFilename)
-	fifoFd, err := unix.Open(fifoName, unix.O_PATH|unix.O_CLOEXEC, 0)
+	flags := unix.O_PATH | unix.O_CLOEXEC
+	// Nested command-mode Sysbox has no procfs, so its init cannot reopen an
+	// O_PATH FIFO through /proc/self/fd. Pass a real read-write fd instead.
+	if c.config.SkipSpecialMounts {
+		flags = unix.O_RDWR | unix.O_CLOEXEC
+	}
+	fifoFd, err := unix.Open(fifoName, flags, 0)
 	if err != nil {
 		return err
 	}
@@ -617,6 +623,12 @@ func (c *linuxContainer) commandTemplate(p *Process, childInitPipe *os.File, chi
 		cmd.SysProcAttr = &unix.SysProcAttr{}
 	}
 	cmd.Env = append(cmd.Env, "GOMAXPROCS="+os.Getenv("GOMAXPROCS"))
+	// Keep early nested nsexec failures observable even when the child exits
+	// before the normal log pipe is initialized. The path is L1-local and is
+	// only enabled for the explicit nested-identity runtime.
+	if c.config.NestedIdentity {
+		cmd.Env = append(cmd.Env, "_SYSBOX_NESTED_TRACE=/var/log/sysbox-runc-inner-parent.log")
+	}
 	cmd.ExtraFiles = append(cmd.ExtraFiles, p.ExtraFiles...)
 	if p.ConsoleSocket != nil {
 		cmd.ExtraFiles = append(cmd.ExtraFiles, p.ConsoleSocket)
@@ -1640,6 +1652,11 @@ func (c *linuxContainer) criuApplyCgroups(pid int, req *criurpc.CriuReq) error {
 	if err := c.cgroupManager.ApplyChildCgroup(pid); err != nil {
 		return err
 	}
+	if c.config.NestedIdentity {
+		if err := c.cgroupManager.ApplyChildCgroup(pid); err != nil {
+			return err
+		}
+	}
 
 	if err := c.cgroupManager.Set(c.config); err != nil {
 		return newSystemError(err)
@@ -2272,7 +2289,10 @@ func (c *linuxContainer) bootstrapData(cloneFlags uintptr, nsMaps map[configs.Na
 		}
 	}
 
-	if c.config.OomScoreAdj != nil {
+	if c.config.SkipSpecialMounts {
+		// The nested command mode intentionally has no procfs. Do not ask
+		// nsexec to restore oom_score_adj after it has entered the container.
+	} else if c.config.OomScoreAdj != nil {
 		// write the configured oom_score_adj
 		r.AddData(&Bytemsg{
 			Type:  OomScoreAdjAttr,
@@ -2321,19 +2341,35 @@ func (c *linuxContainer) bootstrapData(cloneFlags uintptr, nsMaps map[configs.Na
 		Type:  RootlessEUIDAttr,
 		Value: c.config.RootlessEUID,
 	})
+	r.AddData(&Boolmsg{
+		Type:  NestedNetworkAttr,
+		Value: c.config.NestedNetwork,
+	})
 
 	// sysbox-runc: request prep of the rootfs when we create a new mnt-ns
 	_, joinExistingMnt := nsMaps[configs.NEWNS]
 	if !joinExistingMnt {
 
 		r.AddData(&Boolmsg{
-			Type:  PrepRootfsAttr,
-			Value: true,
+			Type: PrepRootfsAttr,
+			// Nested-identity uses NoShift and must not perform the legacy
+			// pre-rootfs bind-to-self/propagation sequence. In an L1 mount
+			// namespace the snapshotter rootfs parent is not guaranteed to be
+			// reachable from the freshly-created L2 mount namespace.
+			Value: !c.config.NestedIdentity,
 		})
 
 		makeParentPriv, parentMount, err := rootfsParentMountIsShared(c.config.Rootfs)
 		if err != nil {
 			return nil, err
+		}
+		// Nested-identity always uses NoShift. The rootfs parent path is in the
+		// L1 mount namespace and can be hidden after we create the L2 mount
+		// namespace, so it must not participate in the old shiftfs preparation
+		// protocol. Making / and the rootfs bind private below is sufficient.
+		if c.config.NestedIdentity {
+			makeParentPriv = false
+			parentMount = ""
 		}
 
 		r.AddData(&Boolmsg{
@@ -2444,7 +2480,7 @@ func (c *linuxContainer) handleReqOp(childPid int, reqs []opReq) error {
 	op := reqs[0].Op
 
 	switch op {
-	case bind, chown, mkdir, overlay, rootfsIDMap, switchDockerDns, sysfs:
+	case bind, chown, mkdir, overlay, rootfsIDMap, switchDockerDns, sysfs, procfs:
 		return c.handleOp(op, childPid, reqs)
 	default:
 		return newSystemError(fmt.Errorf("invalid opReq type %d", int(op)))
@@ -2494,6 +2530,15 @@ func (c *linuxContainer) handleOp(op opReqType, childPid int, reqs []opReq) erro
 		namespaces = append(namespaces,
 			fmt.Sprintf("mnt:/proc/%d/ns/mnt", childPid),
 			fmt.Sprintf("pid:/proc/%d/ns/pid", childPid),
+		)
+	case procfs:
+		// This helper starts as root in L1's userns. Enter the L2 mount and
+		// PID namespaces first, then its child userns last, so the procfs mount
+		// is authorized by the namespace that owns both destinations.
+		namespaces = append(namespaces,
+			fmt.Sprintf("mnt:/proc/%d/ns/mnt", childPid),
+			fmt.Sprintf("pid:/proc/%d/ns/pid", childPid),
+			fmt.Sprintf("user:/proc/%d/ns/user", childPid),
 		)
 
 	case switchDockerDns:

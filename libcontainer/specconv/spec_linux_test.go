@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package specconv
@@ -281,6 +282,50 @@ func TestLinuxCgroupWithMemoryResource(t *testing.T) {
 	}
 	if cgroup.Resources.OomKillDisable != disableOOMKiller {
 		t.Errorf("The OOMKiller should be enabled")
+	}
+}
+
+func TestNestedIdentitySkipsCgroupDeviceFilter(t *testing.T) {
+	spec := &specs.Spec{Linux: &specs.Linux{Resources: &specs.LinuxResources{}}}
+	cgroup, err := CreateCgroupConfig(&CreateOpts{
+		CgroupName:     "nested",
+		Spec:           spec,
+		NestedIdentity: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cgroup.Resources.SkipDevices {
+		t.Fatal("nested identity must inherit the L1 device policy")
+	}
+}
+
+func TestNestedNetworkSandbox(t *testing.T) {
+	sandbox := &specs.Spec{
+		Annotations: map[string]string{"io.kubernetes.cri.container-type": "sandbox"},
+		Linux: &specs.Linux{Namespaces: []specs.LinuxNamespace{
+			{Type: specs.NetworkNamespace, Path: "/var/run/netns/cni-test"},
+		}},
+	}
+	if !nestedNetworkSandbox(sandbox, true) {
+		t.Fatal("nested CRI sandbox did not request a child-owned network namespace")
+	}
+
+	workload := &specs.Spec{
+		Annotations: map[string]string{"io.kubernetes.cri.container-type": "container"},
+		Linux: &specs.Linux{Namespaces: []specs.LinuxNamespace{
+			{Type: specs.NetworkNamespace, Path: "/proc/123/ns/net"},
+		}},
+	}
+	if nestedNetworkSandbox(workload, true) {
+		t.Fatal("nested workload container must join the sandbox network namespace")
+	}
+	if nestedNetworkSandbox(sandbox, false) {
+		t.Fatal("standard Sysbox sandbox unexpectedly requested nested networking")
+	}
+	sandbox.Linux.Namespaces[0].Path = "/var/run/netns/../host"
+	if nestedNetworkSandbox(sandbox, true) {
+		t.Fatal("nested sandbox accepted a network namespace outside the managed directory")
 	}
 }
 

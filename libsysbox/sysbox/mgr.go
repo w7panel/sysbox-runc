@@ -35,7 +35,7 @@ type Mgr struct {
 	Id           string                  // container-id
 	Config       *ipcLib.ContainerConfig // sysbox-mgr mandated container config
 	clonedRootfs string                  // path to cloned rootfs (used when rootfs needs chown but it's on ovfs without metacopy=on)
-
+	MappingMode  ipcLib.MappingMode
 }
 
 func NewMgr(id string, enable bool) *Mgr {
@@ -49,7 +49,20 @@ func NewMgr(id string, enable bool) *Mgr {
 			AllowTrustedXattr: true,
 			SyscontMode:       true,
 		},
+		MappingMode: ipcLib.StandardSubid,
 	}
+}
+
+func (mgr *Mgr) SetMappingMode(mode string) error {
+	switch mode {
+	case "standard-subid":
+		mgr.MappingMode = ipcLib.StandardSubid
+	case "nested-identity":
+		mgr.MappingMode = ipcLib.NestedIdentity
+	default:
+		return fmt.Errorf("invalid mapping mode %q", mode)
+	}
+	return nil
 }
 
 func (mgr *Mgr) Enabled() bool {
@@ -83,6 +96,7 @@ func (mgr *Mgr) Register(spec *specs.Spec) error {
 		Netns:       netns,
 		UidMappings: spec.Linux.UIDMappings,
 		GidMappings: spec.Linux.GIDMappings,
+		MappingMode: mgr.MappingMode,
 	}
 
 	config, err := sysboxMgrGrpc.Register(regInfo)
@@ -91,6 +105,9 @@ func (mgr *Mgr) Register(spec *specs.Spec) error {
 	}
 
 	mgr.Config = config
+	if config.MappingMode != mgr.MappingMode {
+		return fmt.Errorf("sysbox-mgr returned mapping mode %d; expected %d", config.MappingMode, mgr.MappingMode)
+	}
 
 	return nil
 }
@@ -106,6 +123,7 @@ func (mgr *Mgr) Update(userns, netns string,
 		UidMappings:        uidMappings,
 		GidMappings:        gidMappings,
 		RootfsUidShiftType: rootfsUidShiftType,
+		MappingMode:        mgr.MappingMode,
 	}
 
 	if err := sysboxMgrGrpc.Update(updateInfo); err != nil {

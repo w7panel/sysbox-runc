@@ -62,6 +62,19 @@ func needsSetupDev(config *configs.Config) bool {
 func prepareRootfs(pipe io.ReadWriter, iConfig *initConfig) (err error) {
 	config := iConfig.Config
 
+	// NoShift leaves the containerd rootfs mounted in L1's mount namespace.
+	// Clone it onto itself after entering the L2 mount namespace so it becomes
+	// an L2-private mountpoint suitable for pivot_root, without changing
+	// ownership or applying a second ID shift.
+	if config.NestedIdentity {
+		if err := cloneMountAtPath(".", "."); err != nil {
+			return newSystemErrorWithCause(err, "cloning nested rootfs mount")
+		}
+		if err := setMountPropagationAtPath(".", unix.MS_PRIVATE|unix.MS_REC); err != nil {
+			return newSystemErrorWithCause(err, "making nested rootfs private")
+		}
+	}
+
 	if config.RootfsUidShiftType == sh.IDMappedMount {
 		if err := doRootfsIDMapping(config, pipe); err != nil {
 			return newSystemErrorWithCause(err, "ID-mapping rootfs")
@@ -70,6 +83,24 @@ func prepareRootfs(pipe io.ReadWriter, iConfig *initConfig) (err error) {
 
 	if err := effectRootfsMount(); err != nil {
 		return newSystemErrorWithCause(err, "effecting rootfs mount")
+	}
+
+	// The mount helpers below resolve destinations through
+	// /proc/thread-self/fd. Nested-identity intentionally does not inherit L1's
+	// procfs, so ask an L1-root helper to enter the L2 mount, PID, and user
+	// namespaces and mount a fresh procfs. This procfs is private to L2 and the
+	// helper has CAP_SYS_ADMIN in the userns that owns the target namespaces.
+	if config.NestedIdentity {
+		for _, m := range config.Mounts {
+			if m.Device != "proc" {
+				continue
+			}
+			req := opReq{Op: procfs, Rootfs: config.Rootfs, Mount: *m}
+			if err := syncParentDoOp([]opReq{req}, pipe); err != nil {
+				return newSystemErrorWithCause(err, "mounting nested procfs through L1 helper")
+			}
+			break
+		}
 	}
 
 	if err := doMounts(config, pipe, false); err != nil {
@@ -113,7 +144,9 @@ func prepareRootfs(pipe io.ReadWriter, iConfig *initConfig) (err error) {
 		return err
 	}
 
-	if config.NoPivotRoot {
+	if config.NestedIdentity {
+		err = moveRootfsWithMountAPI()
+	} else if config.NoPivotRoot {
 		err = msMoveRoot(config.Rootfs)
 	} else if config.Namespaces.Contains(configs.NEWNS) {
 		err = pivotRoot(config.Rootfs)
@@ -323,6 +356,17 @@ func mountCgroupV2(m *configs.Mount, enableCgroupns bool, config *configs.Config
 	if err := mkdirall(cgroupPath, 0755, config, pipe); err != nil {
 		return err
 	}
+	if config.NestedIdentity {
+		if err := mountFilesystemAtPath(cgroupPath, "cgroup2", m.Flags, m.Data); err != nil {
+			return fmt.Errorf("mount nested cgroup2 with new mount API: %w", err)
+		}
+		for _, pflag := range m.PropagationFlags {
+			if err := setMountPropagationAtPath(cgroupPath, pflag); err != nil {
+				return fmt.Errorf("change nested cgroup2 propagation: %w", err)
+			}
+		}
+		return nil
+	}
 
 	return utils.WithProcfd(".", cgroupPath, func(procfd string) error {
 		if err := unix.Mount(m.Source, procfd, "cgroup2", uintptr(m.Flags), m.Data); err != nil {
@@ -330,13 +374,13 @@ func mountCgroupV2(m *configs.Mount, enableCgroupns bool, config *configs.Config
 			if err == unix.EPERM || err == unix.EBUSY {
 				return unix.Mount("/sys/fs/cgroup", procfd, "", uintptr(m.Flags)|unix.MS_BIND, "")
 			}
-			return nil
+			return err
 		}
 		return nil
 	})
 }
 
-func doTmpfsCopyUp(m *configs.Mount, rootfs, mountLabel string) (Err error) {
+func doTmpfsCopyUp(m *configs.Mount, rootfs, mountLabel string, nestedIdentity bool) (Err error) {
 	// Set up a scratch dir for the tmpfs on the host.
 	tmpdir, err := prepareTmp("/tmp")
 	if err != nil {
@@ -353,7 +397,7 @@ func doTmpfsCopyUp(m *configs.Mount, rootfs, mountLabel string) (Err error) {
 	// m.Destination since we are going to mount *on the host*.
 	oldDest := m.Destination
 	m.Destination = tmpDir
-	err = mountPropagate(m, "/", mountLabel)
+	err = mountPropagate(m, "/", mountLabel, nestedIdentity)
 	m.Destination = oldDest
 	if err != nil {
 		return err
@@ -454,7 +498,19 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 		if err := mkdirall(dest, 0755, config, pipe); err != nil {
 			return fmt.Errorf("failed to created dir for %s mount: %v", m.Device, err)
 		}
-		if m.Device == "sysfs" {
+		if config.SkipSpecialMounts && m.Device == "sysfs" {
+			return nil
+		}
+		if config.SkipSpecialMounts && m.Device == "proc" {
+			if config.NestedIdentity {
+				// Let the L2 init/systemd issue the mount syscall after the
+				// seccomp-notify listener is active; L0 sysbox-fs will service it
+				// in the L2 mount and user namespaces.
+				return nil
+			}
+			return unix.Mount(m.Source, m.Destination, m.Device, uintptr(m.Flags), m.Data)
+		}
+		if m.Device == "sysfs" && !config.NestedIdentity {
 			req := opReq{
 				Op:     sysfs,
 				Rootfs: config.Rootfs,
@@ -466,12 +522,12 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 			return nil
 		}
 		// Selinux kernels do not support labeling of /proc or /sys
-		return mountPropagate(m, ".", "")
+		return mountPropagate(m, ".", "", config.NestedIdentity)
 	case "mqueue":
 		if err := mkdirall(dest, 0755, config, pipe); err != nil {
 			return err
 		}
-		if err := mountPropagate(m, rootfs, ""); err != nil {
+		if err := mountPropagate(m, rootfs, "", config.NestedIdentity); err != nil {
 			return err
 		}
 		return label.SetFileLabel(dest, mountLabel)
@@ -483,9 +539,9 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 			}
 		}
 		if m.Extensions&configs.EXT_COPYUP == configs.EXT_COPYUP {
-			err = doTmpfsCopyUp(m, rootfs, mountLabel)
+			err = doTmpfsCopyUp(m, rootfs, mountLabel, config.NestedIdentity)
 		} else {
-			err = mountPropagate(m, rootfs, mountLabel)
+			err = mountPropagate(m, rootfs, mountLabel, config.NestedIdentity)
 		}
 		if err != nil {
 			return err
@@ -504,6 +560,12 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 		return nil
 	case "cgroup":
 		if cgroups.IsCgroup2UnifiedMode() {
+			// The nested sysfs mount is delayed until after sysbox-fs
+			// registration. Mounting cgroup2 here would be hidden when that
+			// sysfs mount is installed, so defer cgroup2 to the same late phase.
+			if config.NestedIdentity {
+				return nil
+			}
 			return mountCgroupV2(m, enableCgroupns, config, pipe)
 		}
 		return mountCgroupV1(m, enableCgroupns, config, pipe)
@@ -534,7 +596,7 @@ func mountToRootfs(m *configs.Mount, config *configs.Config, enableCgroupns bool
 		if err := mkdirall(dest, 0755, config, pipe); err != nil {
 			return err
 		}
-		return mountPropagate(m, rootfs, mountLabel)
+		return mountPropagate(m, rootfs, mountLabel, config.NestedIdentity)
 	}
 }
 
@@ -571,6 +633,13 @@ func doBindMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermoun
 	for _, m := range config.Mounts {
 
 		if m.Device != "bind" {
+			continue
+		}
+		// In command-mode nested Sysbox, sysbox-fs's proc/sys emulation
+		// sources are not mountable through the outer user namespace. Match the
+		// source rather than the destination: at this stage destinations can be
+		// relative to the rootfs, while SysboxfsMounts are absolute.
+		if config.SkipSpecialMounts && strings.HasPrefix(m.Source, "/var/lib/sysboxfs") {
 			continue
 		}
 
@@ -627,6 +696,7 @@ func doBindMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermoun
 				mntReqs[0].Op = bind
 				mntReqs[0].Rootfs = config.Rootfs
 				mntReqs[0].FsuidMapFailOnErr = config.FsuidMapFailOnErr
+				mntReqs[0].NestedIdentity = config.NestedIdentity
 
 				if err := syncParentDoOp(mntReqs, pipe); err != nil {
 					return newSystemErrorWithCause(err, "syncing with parent runc to perform bind mounts")
@@ -645,8 +715,9 @@ func doBindMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermoun
 			Label:             config.MountLabel,
 			Rootfs:            config.Rootfs,
 			FsuidMapFailOnErr: config.FsuidMapFailOnErr,
+			SkipSpecialMounts: config.SkipSpecialMounts,
+			NestedIdentity:    config.NestedIdentity,
 		}
-
 		mntReqs = append(mntReqs, req)
 	}
 
@@ -655,6 +726,7 @@ func doBindMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermoun
 		mntReqs[0].Op = bind
 		mntReqs[0].Rootfs = config.Rootfs
 		mntReqs[0].FsuidMapFailOnErr = config.FsuidMapFailOnErr
+		mntReqs[0].NestedIdentity = config.NestedIdentity
 
 		if err := syncParentDoOp(mntReqs, pipe); err != nil {
 			return newSystemErrorWithCause(err, "syncing with parent runc to perform bind mounts")
@@ -808,13 +880,16 @@ func createDevices(config *configs.Config, pipe io.ReadWriter) error {
 	return nil
 }
 
-func bindMountDeviceNode(rootfs, dest string, node *devices.Device) error {
+func bindMountDeviceNode(rootfs, dest string, node *devices.Device, nestedIdentity bool) error {
 	f, err := os.Create(dest)
 	if err != nil && !os.IsExist(err) {
 		return err
 	}
 	if f != nil {
 		f.Close()
+	}
+	if nestedIdentity {
+		return cloneMountAtPath(node.Path, dest)
 	}
 	return utils.WithProcfd(rootfs, dest, func(procfd string) error {
 		return unix.Mount(node.Path, procfd, "bind", unix.MS_BIND, "")
@@ -840,13 +915,13 @@ func createDeviceNode(node *devices.Device, bind bool, config *configs.Config, p
 		return err
 	}
 	if bind {
-		return bindMountDeviceNode(rootfs, dest, node)
+		return bindMountDeviceNode(rootfs, dest, node, config.NestedIdentity)
 	}
 	if err := mknodDevice(dest, node); err != nil {
 		if os.IsExist(err) {
 			return nil
 		} else if os.IsPermission(err) {
-			return bindMountDeviceNode(rootfs, dest, node)
+			return bindMountDeviceNode(rootfs, dest, node, config.NestedIdentity)
 		}
 		return err
 	}
@@ -1074,6 +1149,39 @@ func chroot() error {
 	return unix.Chdir("/")
 }
 
+// moveRootfsWithMountAPI replaces the current mount namespace root with a
+// detached clone of the fully prepared rootfs. Unlike pivot_root and legacy
+// MS_MOVE, all path resolution is anchored by file descriptors, which works
+// when this process is root in a nested user namespace but cannot address the
+// L1 rootfs through its procfs view.
+func moveRootfsWithMountAPI() error {
+	newRootFd, err := unix.OpenTree(unix.AT_FDCWD, ".", unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC|unix.AT_RECURSIVE)
+	if err != nil {
+		return fmt.Errorf("open_tree prepared rootfs: %w", err)
+	}
+	defer unix.Close(newRootFd)
+
+	oldRootFd, err := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open old root: %w", err)
+	}
+	defer unix.Close(oldRootFd)
+
+	if err := unix.MoveMount(newRootFd, "", oldRootFd, "", unix.MOVE_MOUNT_F_EMPTY_PATH|unix.MOVE_MOUNT_T_EMPTY_PATH); err != nil {
+		return fmt.Errorf("move_mount prepared rootfs onto /: %w", err)
+	}
+	if err := unix.Fchdir(newRootFd); err != nil {
+		return fmt.Errorf("fchdir prepared rootfs: %w", err)
+	}
+	if err := unix.Chroot("."); err != nil {
+		return fmt.Errorf("chroot prepared rootfs: %w", err)
+	}
+	if err := unix.Chdir("/"); err != nil {
+		return fmt.Errorf("chdir prepared root: %w", err)
+	}
+	return nil
+}
+
 // createIfNotExists creates a file or a directory only if it does not already exist.
 func createIfNotExists(path string, isDir bool, config *configs.Config, pipe io.ReadWriter) error {
 
@@ -1194,7 +1302,7 @@ func verifyDevNull(f *os.File) error {
 // mounts ( proc/kcore ).
 // For files, maskPath bind mounts /dev/null over the top of the specified path.
 // For directories, maskPath mounts read-only tmpfs over the top of the specified path.
-func maskPaths(paths []string, mountLabel string) error {
+func maskPaths(paths []string, mountLabel string, nestedIdentity bool) error {
 	devNull, err := os.OpenFile("/dev/null", unix.O_PATH, 0)
 	if err != nil {
 		return fmt.Errorf("can't mask paths: %w", err)
@@ -1225,12 +1333,20 @@ func maskPaths(paths []string, mountLabel string) error {
 		if st.IsDir() {
 			// Destination is a directory: bind mount a ro tmpfs over it.
 			dstType = "dir"
-			err = mount("tmpfs", path, "tmpfs", unix.MS_RDONLY, label.FormatMountLabel("", mountLabel))
+			if nestedIdentity {
+				err = mountFilesystemAtPath(path, "tmpfs", unix.MS_RDONLY, label.FormatMountLabel("", mountLabel))
+			} else {
+				err = mount("tmpfs", path, "tmpfs", unix.MS_RDONLY, label.FormatMountLabel("", mountLabel))
+			}
 		} else {
 			// Destination is a file: mount it to /dev/null.
 			dstType = "path"
-			dstFd := filepath.Join(procSelfFd, strconv.Itoa(int(dstFh.Fd())))
-			err = mountViaFds("", devNullSrc, path, dstFd, "", unix.MS_BIND, "")
+			if nestedIdentity {
+				err = cloneMountAtPath("/dev/null", path)
+			} else {
+				dstFd := filepath.Join(procSelfFd, strconv.Itoa(int(dstFh.Fd())))
+				err = mountViaFds("", devNullSrc, path, dstFd, "", unix.MS_BIND, "")
+			}
 		}
 		dstFh.Close()
 		if err != nil {
@@ -1269,7 +1385,7 @@ func remount(m *configs.Mount) error {
 
 // Do the mount operation followed by additional mounts required to take care
 // of propagation flags. This will always be scoped inside the container rootfs.
-func mountPropagate(m *configs.Mount, rootfs string, mountLabel string) error {
+func mountPropagate(m *configs.Mount, rootfs string, mountLabel string, nestedIdentity bool) error {
 	var (
 		data  = label.FormatMountLabel(m.Data, mountLabel)
 		flags = m.Flags
@@ -1287,23 +1403,162 @@ func mountPropagate(m *configs.Mount, rootfs string, mountLabel string) error {
 	// mutating underneath us, we verify that we are actually going to mount
 	// inside the container with WithProcfd() -- mounting through a procfd
 	// mounts on the target.
-	if err := utils.WithProcfd(rootfs, m.Destination, func(procfd string) error {
-		return unix.Mount(m.Source, procfd, m.Device, uintptr(flags), data)
+	mountTarget := func(fn func(string) error) error {
+		if nestedIdentity {
+			return fn(m.Destination)
+		}
+		return utils.WithProcfd(rootfs, m.Destination, fn)
+	}
+	// In a nested user namespace, legacy mount(2) resolves the mount target
+	// through the caller's procfs and can fail with ENOENT even when the target
+	// is present in the L2 mount namespace. Create detached pseudo-filesystem
+	// mounts and attach them by target fd instead. This is required for both
+	// the /dev tmpfs and its devpts and mqueue child mounts.
+	if nestedIdentity && (m.Device == "tmpfs" || m.Device == "mqueue" || m.Device == "devpts") {
+		if err := mountNestedFilesystem(m, flags, data, mountFilesystemAtPath, unix.Mount); err != nil {
+			return fmt.Errorf("mount nested %s with new mount API: %w", m.Device, err)
+		}
+		for _, pflag := range m.PropagationFlags {
+			if err := setMountPropagationAtPath(m.Destination, pflag); err != nil {
+				return fmt.Errorf("change nested %s propagation: %w", m.Device, err)
+			}
+		}
+		return nil
+	}
+	if err := mountTarget(func(target string) error {
+		return unix.Mount(m.Source, target, m.Device, uintptr(flags), data)
 	}); err != nil {
 		return fmt.Errorf("mount through procfd: %w", err)
 	}
 	// We have to apply mount propagation flags in a separate WithProcfd() call
 	// because the previous call invalidates the passed procfd -- the mount
 	// target needs to be re-opened.
-	if err := utils.WithProcfd(rootfs, m.Destination, func(procfd string) error {
+	if err := mountTarget(func(target string) error {
 		for _, pflag := range m.PropagationFlags {
-			if err := unix.Mount("", procfd, "", uintptr(pflag), ""); err != nil {
+			if err := unix.Mount("", target, "", uintptr(pflag), ""); err != nil {
 				return err
 			}
 		}
 		return nil
 	}); err != nil {
 		return fmt.Errorf("change mount propagation through procfd: %w", err)
+	}
+	return nil
+}
+
+// mountNestedFilesystem prefers fd-based mounts, which avoid resolving the
+// target through the outer container's procfs. Some outer Sysbox seccomp
+// policies reject fsconfig(FSCONFIG_CMD_CREATE), so retry mount(2) only for
+// EPERM; all other new-mount failures remain fatal.
+func mountNestedFilesystem(m *configs.Mount, flags int, data string, newMount newMountAPI, legacyMount legacyMountAPI) error {
+	if err := newMount(m.Destination, m.Device, flags, data); err != nil {
+		if !errors.Is(err, unix.EPERM) {
+			return err
+		}
+		if legacyErr := legacyMount(m.Source, m.Destination, m.Device, uintptr(flags), data); legacyErr != nil {
+			return fmt.Errorf("new mount API failed: %v; mount(2) fallback failed: %w", err, legacyErr)
+		}
+	}
+	return nil
+}
+
+func setMountPropagationAtPath(target string, propagation int) error {
+	targetFd, err := unix.Open(target, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open propagation target %q: %w", target, err)
+	}
+	defer unix.Close(targetFd)
+
+	flags := uint(unix.AT_EMPTY_PATH)
+	if propagation&unix.MS_REC != 0 {
+		flags |= unix.AT_RECURSIVE
+	}
+	attr := &unix.MountAttr{Propagation: uint64(propagation &^ unix.MS_REC)}
+	if err := unix.MountSetattr(targetFd, "", flags, attr); err != nil {
+		return fmt.Errorf("mount_setattr propagation on %q: %w", target, err)
+	}
+	return nil
+}
+
+func setMountAttrsAtPath(target string, mountFlags int) error {
+	targetFd, err := unix.Open(target, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open mount attribute target %q: %w", target, err)
+	}
+	defer unix.Close(targetFd)
+
+	var set, clear uint64
+	for _, option := range []struct {
+		mountFlag int
+		attrFlag  uint64
+	}{
+		{unix.MS_RDONLY, unix.MOUNT_ATTR_RDONLY},
+		{unix.MS_NOSUID, unix.MOUNT_ATTR_NOSUID},
+		{unix.MS_NODEV, unix.MOUNT_ATTR_NODEV},
+		{unix.MS_NOEXEC, unix.MOUNT_ATTR_NOEXEC},
+	} {
+		if mountFlags&option.mountFlag != 0 {
+			set |= option.attrFlag
+		} else {
+			clear |= option.attrFlag
+		}
+	}
+	attr := &unix.MountAttr{Attr_set: set, Attr_clr: clear}
+	if err := unix.MountSetattr(targetFd, "", unix.AT_EMPTY_PATH, attr); err != nil {
+		return fmt.Errorf("mount_setattr flags on %q: %w", target, err)
+	}
+	return nil
+}
+
+func mountFilesystemAtPath(target, fsType string, flags int, data string) error {
+	targetFd, err := unix.Open(target, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open target %q: %w", target, err)
+	}
+	defer unix.Close(targetFd)
+
+	fsFd, err := unix.Fsopen(fsType, unix.FSOPEN_CLOEXEC)
+	if err != nil {
+		return fmt.Errorf("fsopen %s: %w", fsType, err)
+	}
+	defer unix.Close(fsFd)
+	for _, option := range strings.Split(data, ",") {
+		if option == "" {
+			continue
+		}
+		key, value, hasValue := strings.Cut(option, "=")
+		if hasValue {
+			err = unix.FsconfigSetString(fsFd, key, value)
+		} else {
+			err = unix.FsconfigSetFlag(fsFd, key)
+		}
+		if err != nil {
+			return fmt.Errorf("fsconfig option %q: %w", option, err)
+		}
+	}
+	if err := unix.FsconfigCreate(fsFd); err != nil {
+		return fmt.Errorf("fsconfig create %s: %w", fsType, err)
+	}
+	mountAttrs := 0
+	if flags&unix.MS_RDONLY != 0 {
+		mountAttrs |= unix.MOUNT_ATTR_RDONLY
+	}
+	if flags&unix.MS_NOSUID != 0 {
+		mountAttrs |= unix.MOUNT_ATTR_NOSUID
+	}
+	if flags&unix.MS_NODEV != 0 {
+		mountAttrs |= unix.MOUNT_ATTR_NODEV
+	}
+	if flags&unix.MS_NOEXEC != 0 {
+		mountAttrs |= unix.MOUNT_ATTR_NOEXEC
+	}
+	mountFd, err := unix.Fsmount(fsFd, unix.FSMOUNT_CLOEXEC, mountAttrs)
+	if err != nil {
+		return fmt.Errorf("fsmount %s: %w", fsType, err)
+	}
+	defer unix.Close(mountFd)
+	if err := unix.MoveMount(mountFd, "", targetFd, "", unix.MOVE_MOUNT_F_EMPTY_PATH|unix.MOVE_MOUNT_T_EMPTY_PATH); err != nil {
+		return fmt.Errorf("move_mount %s to %q: %w", fsType, target, err)
 	}
 	return nil
 }
@@ -1330,6 +1585,9 @@ func doRootfsIDMapping(config *configs.Config, pipe io.ReadWriter) error {
 // If sysboxfsOvermounts is true, then only mounts on top of sysbox-fs emulated paths are
 // mounted (e.g., mounts under /proc/sys/). Otherwise such mounts are skipped.
 func doMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermountsOnly bool) error {
+	if doSysboxfsOvermountsOnly && config.SkipSpecialMounts {
+		return nil
+	}
 
 	chownList := []string{}
 
@@ -1358,7 +1616,7 @@ func doMounts(config *configs.Config, pipe io.ReadWriter, doSysboxfsOvermountsOn
 			// changing ownership of any sysfs mountpoint causes the ownership
 			// change to propagate to all other sysfs mountpoints in the system.
 
-			if m.Device == "proc" {
+			if m.Device == "proc" && !config.NestedIdentity {
 				chownList = append(chownList, "proc")
 			}
 		}

@@ -14,6 +14,8 @@ const (
 )
 
 type Cgroup struct {
+	NestedIdentity bool `json:"nested_identity,omitempty"`
+
 	// Deprecated, use Path instead
 	Name string `json:"name,omitempty"`
 

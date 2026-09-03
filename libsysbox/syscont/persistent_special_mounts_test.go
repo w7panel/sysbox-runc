@@ -34,6 +34,25 @@ func writePersistentSpecialHandoff(t *testing.T, root, containerID string, hando
 	}
 }
 
+func TestRsyncMetadataUnsupported(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{name: "acl client", text: "rsync: ACLs are not supported on this client", want: true},
+		{name: "xattr client", text: "xattrs are not supported", want: true},
+		{name: "ordinary io", text: "rsync: connection unexpectedly closed", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := rsyncMetadataUnsupported(tt.text); got != tt.want {
+				t.Fatalf("rsyncMetadataUnsupported(%q) = %v, want %v", tt.text, got, tt.want)
+			}
+		})
+	}
+}
+
 func persistentSpecialTestSpec(t *testing.T, podsDir, podUID, layerPath string) (*specs.Spec, string) {
 	t.Helper()
 	pvcRoot := filepath.Join(podsDir, podUID, "volumes", "kubernetes.io~csi", "pvc-test", "mount")
