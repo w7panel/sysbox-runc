@@ -81,12 +81,15 @@ func prepareRootfs(pipe io.ReadWriter, iConfig *initConfig) (err error) {
 		if err := createDevices(config, pipe); err != nil {
 			return newSystemErrorWithCause(err, "creating device nodes")
 		}
-		if err := setupPtmx(config); err != nil {
-			return newSystemErrorWithCause(err, "setting up ptmx")
-		}
 		if err := setupDevSymlinks(config.Rootfs); err != nil {
 			return newSystemErrorWithCause(err, "setting up /dev symlinks")
 		}
+	}
+	// A bind-mounted /dev skips full device setup, but devpts still requires
+	// the conventional /dev/ptmx entry for OCI exec with a TTY. Create it only
+	// when absent so we never replace a supplied device node.
+	if err := setupPtmxIfMissing(); err != nil {
+		return newSystemErrorWithCause(err, "setting up ptmx")
 	}
 
 	// Signal the parent to run the pre-start hooks.
@@ -939,6 +942,18 @@ func setupPtmx(config *configs.Config) error {
 		return err
 	}
 	if err := os.Symlink("pts/ptmx", ptmx); err != nil {
+		return fmt.Errorf("symlink dev ptmx %s", err)
+	}
+	return nil
+}
+
+func setupPtmxIfMissing() error {
+	if _, err := os.Lstat("dev/ptmx"); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Symlink("pts/ptmx", "dev/ptmx"); err != nil {
 		return fmt.Errorf("symlink dev ptmx %s", err)
 	}
 	return nil
