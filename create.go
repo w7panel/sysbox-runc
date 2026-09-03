@@ -84,9 +84,6 @@ command(s) that get executed on start, edit the args parameter of the spec. See
 		withFs := !context.GlobalBool("no-sysbox-fs")
 
 		sysbox := sysbox.NewSysbox(id, withMgr, withFs)
-		if err = sysbox.Mgr.SetMappingMode(context.GlobalString("mapping-mode")); err != nil {
-			return err
-		}
 
 		// register with sysMgr
 		if sysbox.Mgr.Enabled() {
@@ -113,7 +110,7 @@ command(s) that get executed on start, edit the args parameter of the spec. See
 
 		// pre-register with sysFs
 		if sysbox.Fs.Enabled() {
-			if err = sysbox.Fs.PreRegister(spec.Linux.Namespaces, sysbox.Mgr.Config.MappingMode); err != nil {
+			if err = sysbox.Fs.PreRegister(spec.Linux.Namespaces); err != nil {
 				return err
 			}
 			defer func() {

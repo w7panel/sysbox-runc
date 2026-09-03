@@ -20,7 +20,6 @@ import (
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
 	dbus "github.com/godbus/dbus/v5"
 	sh "github.com/nestybox/sysbox-libs/idShiftUtils"
-	utils "github.com/nestybox/sysbox-libs/utils"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/devices"
@@ -333,7 +332,6 @@ type CreateOpts struct {
 	RootlessCgroups     bool
 	RootfsUidShiftType  sh.IDShiftType
 	BindMntUidShiftType sh.IDShiftType
-	NestedIdentity      bool
 	SwitchDockerDns     bool
 	RootfsCloned        bool
 	FsuidMapFailOnErr   bool
@@ -379,22 +377,9 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		RootfsCloned:        opts.RootfsCloned,
 		FsuidMapFailOnErr:   opts.FsuidMapFailOnErr,
 		IDshiftIgnoreList:   opts.IDshiftIgnoreList,
-		// The environment form is used only by the command-mode nested Sysbox
-		// runtime wrapper. Unlike arbitrary Kubernetes annotations it is
-		// guaranteed to reach the runc parent process, which serializes this
-		// setting into initConfig for the child init process.
-		SkipSpecialMounts: spec.Annotations["sysbox/skip-special-mounts"] == "true" || os.Getenv("SYSBOX_SKIP_SPECIAL_MOUNTS") == "true" || opts.NestedIdentity,
-		NestedIdentity:    opts.NestedIdentity,
-		NestedNetwork:     nestedNetworkSandbox(spec, opts.NestedIdentity),
 	}
 
 	for _, m := range spec.Mounts {
-		// The nested-K3s Sysbox path executes /proc/self/exe while creating
-		// network namespaces. Apply the opt-in at the last OCI-to-libcontainer
-		// boundary as CRI v2 may have lost the original annotation earlier.
-		if filepath.Clean(m.Destination) == "/proc" {
-			m.Options = utils.StringSliceRemove(m.Options, []string{"noexec"})
-		}
 		mount, err := createLibcontainerMount(cwd, m)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create lib container mount: %v", err)
@@ -461,9 +446,6 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 			}
 			config.Seccomp = seccomp
 		}
-		if config.SkipSpecialMounts || config.NestedIdentity {
-			config.Seccomp = nil
-		}
 		if spec.Linux.IntelRdt != nil {
 			config.IntelRdt = &configs.IntelRdt{}
 			if spec.Linux.IntelRdt.L3CacheSchema != "" {
@@ -494,30 +476,6 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 	createHooks(spec, config)
 	config.Version = specs.Version
 	return config, nil
-}
-
-func nestedNetworkSandbox(spec *specs.Spec, nestedIdentity bool) bool {
-	if !nestedIdentity || spec.Annotations["io.kubernetes.cri.container-type"] != "sandbox" || spec.Linux == nil {
-		return false
-	}
-	for _, ns := range spec.Linux.Namespaces {
-		if ns.Type != specs.NetworkNamespace || ns.Path == "" {
-			continue
-		}
-		path := filepath.Clean(ns.Path)
-		return nestedNetnsPath(path)
-	}
-	return false
-}
-
-func nestedNetnsPath(path string) bool {
-	for _, prefix := range []string{"/run/netns", "/var/run/netns"} {
-		rel, err := filepath.Rel(prefix, path)
-		if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return true
-		}
-	}
-	return false
 }
 
 func createLibcontainerMount(cwd string, m specs.Mount) (*configs.Mount, error) {
@@ -648,12 +606,7 @@ func CreateCgroupConfig(opts *CreateOpts, defaultDevs []*devices.Device) (*confi
 	)
 
 	c := &configs.Cgroup{
-		Resources: &configs.Resources{
-			// A cgroup device BPF program cannot be loaded from a non-initial
-			// user namespace. Nested containers inherit the L1 device policy.
-			SkipDevices: opts.NestedIdentity,
-		},
-		NestedIdentity: opts.NestedIdentity,
+		Resources: &configs.Resources{},
 	}
 
 	if useSystemdCgroup {

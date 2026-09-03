@@ -1,4 +1,3 @@
-//go:build linux
 // +build linux
 
 package systemd
@@ -17,7 +16,6 @@ import (
 	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/fs2"
-	"github.com/opencontainers/runc/libcontainer/cgroups/fscommon"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -27,9 +25,8 @@ type unifiedManager struct {
 	mu      sync.Mutex
 	cgroups *configs.Cgroup
 	// path is like "/sys/fs/cgroup/user.slice/user-1001.slice/session-1.scope"
-	path        string
-	rootless    bool
-	nestedStage int
+	path     string
+	rootless bool
 }
 
 func NewUnifiedManager(config *configs.Cgroup, path string, rootless bool) cgroups.Manager {
@@ -176,13 +173,11 @@ func genV2ResourcesProperties(c *configs.Cgroup, conn *systemdDbus.Conn) ([]syst
 	//       aren't the end of the world, but it is a bit concerning. However
 	//       it's unclear if systemd removes all eBPF programs attached when
 	//       doing SetUnitProperties...
-	if !r.SkipDevices {
-		deviceProperties, err := generateDeviceProperties(r.Devices)
-		if err != nil {
-			return nil, err
-		}
-		properties = append(properties, deviceProperties...)
+	deviceProperties, err := generateDeviceProperties(r.Devices)
+	if err != nil {
+		return nil, err
 	}
+	properties = append(properties, deviceProperties...)
 
 	if r.Memory != 0 {
 		properties = append(properties,
@@ -517,19 +512,10 @@ func (m *unifiedManager) Exists() bool {
 }
 
 func (m *unifiedManager) CreateChildCgroup(config *configs.Config) error {
-	if config != nil && config.NestedIdentity && !cgroups.IsCgroup2UnifiedMode() {
-		return fmt.Errorf("nested-identity cgroup delegation requires cgroup v2")
-	}
 
 	// Change the cgroup ownership to match the root user in the system
 	// container (needed for delegation).
 	path := m.path
-	if config.NestedIdentity {
-		path = filepath.Join(path, "sysbox.delegate")
-		if err := os.MkdirAll(path, 0755); err != nil {
-			return err
-		}
-	}
 
 	rootuid, err := config.HostRootUID()
 	if err != nil {
@@ -615,57 +601,13 @@ func (m *unifiedManager) CreateChildCgroup(config *configs.Config) error {
 }
 
 func (m *unifiedManager) ApplyChildCgroup(pid int) error {
-	if m.cgroups.NestedIdentity && !cgroups.IsCgroup2UnifiedMode() {
-		return fmt.Errorf("nested-identity cgroup delegation requires cgroup v2")
-	}
-	if m.cgroups.NestedIdentity && m.nestedStage == 0 {
-		m.nestedStage++
-		return cgroups.EnterPid(map[string]string{"": filepath.Join(m.path, "sysbox.delegate")}, pid)
-	}
 	paths := make(map[string]string, 1)
-	base := m.path
-	if m.cgroups.NestedIdentity {
-		base = filepath.Join(base, "sysbox.delegate")
-	}
-	paths[""] = filepath.Join(base, "init.scope")
-	if err := cgroups.EnterPid(paths, pid); err != nil {
-		return err
-	}
-	if m.cgroups.NestedIdentity {
-		return enableNestedSystemdControllers(m.path, base)
-	}
-	return nil
+	paths[""] = filepath.Join(m.path, "init.scope")
+	return cgroups.EnterPid(paths, pid)
 }
 
 func (m *unifiedManager) GetChildCgroupPaths() map[string]string {
-	if m.cgroups.NestedIdentity {
-		return map[string]string{"": filepath.Join(m.path, "sysbox.delegate", "init.scope")}
-	}
 	return m.GetPaths()
-}
-
-func enableNestedSystemdControllers(limitPath, delegatePath string) error {
-	for _, path := range []string{limitPath, delegatePath} {
-		procs, err := fscommon.ReadFile(path, "cgroup.procs")
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(procs) != "" {
-			return fmt.Errorf("nested cgroup delegation node %s still contains processes", path)
-		}
-		controllers, err := fscommon.ReadFile(path, "cgroup.controllers")
-		if err != nil {
-			return err
-		}
-		fields := strings.Fields(controllers)
-		if len(fields) == 0 {
-			continue
-		}
-		if err := fscommon.WriteFile(path, "cgroup.subtree_control", "+"+strings.Join(fields, " +")); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (m *unifiedManager) GetType() cgroups.CgroupType {

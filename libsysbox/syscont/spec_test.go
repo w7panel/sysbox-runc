@@ -139,81 +139,6 @@ func TestCfgNamespacesAddsDefaultTimeOffsets(t *testing.T) {
 	}
 }
 
-func TestCfgNamespacesNestedModeIsolation(t *testing.T) {
-	baseNamespaces := []specs.LinuxNamespace{
-		{Type: specs.PIDNamespace},
-		{Type: specs.IPCNamespace},
-		{Type: specs.UTSNamespace},
-		{Type: specs.MountNamespace},
-		{Type: specs.NetworkNamespace},
-	}
-
-	tests := []struct {
-		name        string
-		nestedEnv   string
-		annotations map[string]string
-		wantUserns  bool
-	}{
-		{name: "default runtime", wantUserns: true},
-		{name: "annotation alone", annotations: map[string]string{skipSpecialMountsAnnotation: "true"}, wantUserns: true},
-		// The wrapper only controls special-mount handling; nested identity must
-		// always retain a newly-created child user namespace.
-		{name: "dedicated wrapper", nestedEnv: "true", wantUserns: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("SYSBOX_SKIP_SPECIAL_MOUNTS", tt.nestedEnv)
-			spec := &specs.Spec{
-				Annotations: tt.annotations,
-				Linux:       &specs.Linux{Namespaces: append([]specs.LinuxNamespace(nil), baseNamespaces...)},
-			}
-			if err := cfgNamespaces(&sysbox.Mgr{}, spec); err != nil {
-				t.Fatalf("cfgNamespaces() error = %v", err)
-			}
-
-			gotUserns := false
-			for _, ns := range spec.Linux.Namespaces {
-				if ns.Type == specs.UserNamespace {
-					gotUserns = true
-					break
-				}
-			}
-			if gotUserns != tt.wantUserns {
-				t.Fatalf("user namespace present = %v, want %v", gotUserns, tt.wantUserns)
-			}
-		})
-	}
-}
-
-func TestCfgNamespacesNestedIdentityCreatesUserns(t *testing.T) {
-	mgr := &sysbox.Mgr{Config: &ipcLib.ContainerConfig{MappingMode: ipcLib.NestedIdentity}}
-	base := []specs.LinuxNamespace{
-		{Type: specs.PIDNamespace}, {Type: specs.IPCNamespace},
-		{Type: specs.UTSNamespace}, {Type: specs.MountNamespace},
-		{Type: specs.NetworkNamespace},
-	}
-	spec := &specs.Spec{Linux: &specs.Linux{Namespaces: base}}
-	if err := cfgNamespaces(mgr, spec); err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, ns := range spec.Linux.Namespaces {
-		if ns.Type == specs.UserNamespace && ns.Path == "" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("nested-identity did not create a child user namespace")
-	}
-
-	spec = &specs.Spec{Linux: &specs.Linux{Namespaces: append(base,
-		specs.LinuxNamespace{Type: specs.UserNamespace, Path: "/proc/1/ns/user"})}}
-	if err := cfgNamespaces(mgr, spec); err == nil {
-		t.Fatal("nested-identity accepted an existing user namespace")
-	}
-}
-
 func TestGetSpecialDirs(t *testing.T) {
 	want := map[string]ipcLib.MntKind{
 		"/var/lib/docker":       ipcLib.MntVarLibDocker,
@@ -276,19 +201,9 @@ func TestGetSpecialDirsUsesCustomK3sDataDir(t *testing.T) {
 }
 
 func TestValidatePersistentSpecialIDMapMountFailsWithoutIDMapMode(t *testing.T) {
-	err := validatePersistentSpecialIDMapMount(sh.Shiftfs, ipcLib.StandardSubid, specs.Mount{Source: t.TempDir(), Destination: "/srv/custom"})
+	err := validatePersistentSpecialIDMapMount(sh.Shiftfs, specs.Mount{Source: t.TempDir(), Destination: "/srv/custom"})
 	if err == nil {
 		t.Fatal("persistent custom special path must fail without idmapped mount mode")
-	}
-}
-
-func TestValidatePersistentSpecialNoShiftRequiresNestedIdentity(t *testing.T) {
-	mount := specs.Mount{Source: t.TempDir(), Destination: "/srv/custom"}
-	if err := validatePersistentSpecialIDMapMount(sh.NoShift, ipcLib.StandardSubid, mount); err == nil {
-		t.Fatal("standard subid persistent special mount accepted NoShift")
-	}
-	if err := validatePersistentSpecialIDMapMount(sh.NoShift, ipcLib.NestedIdentity, mount); err != nil {
-		t.Fatalf("nested identity persistent special mount rejected NoShift: %v", err)
 	}
 }
 
@@ -319,39 +234,6 @@ func TestEnsureFuseDeviceAccess(t *testing.T) {
 	if !rule.Allow || rule.Type != "c" || rule.Major == nil || *rule.Major != fuseDeviceMajor ||
 		rule.Minor == nil || *rule.Minor != fuseDeviceMinor || rule.Access != "rwm" {
 		t.Fatalf("unexpected fuse cgroup rule: %#v", rule)
-	}
-}
-
-func TestCfgProcExec(t *testing.T) {
-	tests := []struct {
-		name        string
-		annotations map[string]string
-		wantNoexec  bool
-	}{
-		{name: "default", wantNoexec: true},
-		{name: "false", annotations: map[string]string{allowProcExecAnnotation: "false"}, wantNoexec: true},
-		{name: "upper case", annotations: map[string]string{allowProcExecAnnotation: "TRUE"}, wantNoexec: true},
-		{name: "enabled", annotations: map[string]string{allowProcExecAnnotation: "true"}, wantNoexec: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			spec := &specs.Spec{Annotations: tt.annotations, Mounts: []specs.Mount{
-				{Destination: "/proc", Type: "proc", Options: []string{"noexec", "nosuid", "nodev"}},
-				{Destination: "/sys", Type: "sysfs", Options: []string{"noexec", "nosuid", "nodev"}},
-			}}
-			cfgProcExec(spec, false)
-			gotNoexec := false
-			for _, option := range spec.Mounts[0].Options {
-				gotNoexec = gotNoexec || option == "noexec"
-			}
-			if gotNoexec != tt.wantNoexec {
-				t.Fatalf("/proc noexec = %v, want %v", gotNoexec, tt.wantNoexec)
-			}
-			if !reflect.DeepEqual(spec.Mounts[1].Options, []string{"noexec", "nosuid", "nodev"}) {
-				t.Fatalf("/sys options changed: %v", spec.Mounts[1].Options)
-			}
-		})
 	}
 }
 
@@ -688,7 +570,7 @@ func TestValidateIDMappings(t *testing.T) {
 	spec.Linux.UIDMappings = []specs.LinuxIDMapping{}
 	spec.Linux.GIDMappings = []specs.LinuxIDMapping{}
 
-	err = validateIDMappings(spec, ipcLib.StandardSubid)
+	err = validateIDMappings(spec)
 	if err == nil {
 		t.Errorf("validateIDMappings(): expected failure due to empty mappings, but it passed")
 	}
@@ -701,7 +583,7 @@ func TestValidateIDMappings(t *testing.T) {
 
 	spec.Linux.GIDMappings = spec.Linux.UIDMappings
 
-	err = validateIDMappings(spec, ipcLib.StandardSubid)
+	err = validateIDMappings(spec)
 	if err == nil {
 		t.Errorf("validateIDMappings(): expected failure due to non-contiguous container ID mappings, but it passed")
 	}
@@ -714,7 +596,7 @@ func TestValidateIDMappings(t *testing.T) {
 
 	spec.Linux.GIDMappings = spec.Linux.UIDMappings
 
-	err = validateIDMappings(spec, ipcLib.StandardSubid)
+	err = validateIDMappings(spec)
 	if err == nil {
 		t.Errorf("validateIDMappings(): expected failure due to non-contiguous host ID mappings, but it passed")
 	}
@@ -726,7 +608,7 @@ func TestValidateIDMappings(t *testing.T) {
 
 	spec.Linux.GIDMappings = spec.Linux.UIDMappings
 
-	err = validateIDMappings(spec, ipcLib.StandardSubid)
+	err = validateIDMappings(spec)
 	if err == nil {
 		t.Errorf("validateIDMappings(): expected failure due to container ID range starting above 0, but it passed")
 	}
@@ -738,7 +620,7 @@ func TestValidateIDMappings(t *testing.T) {
 
 	spec.Linux.GIDMappings = spec.Linux.UIDMappings
 
-	err = validateIDMappings(spec, ipcLib.StandardSubid)
+	err = validateIDMappings(spec)
 	if err == nil {
 		t.Errorf("validateIDMappings(): expected failure due to ID range size < %d, but it passed", IdRangeMin)
 	}
@@ -752,7 +634,7 @@ func TestValidateIDMappings(t *testing.T) {
 		{ContainerID: 0, HostID: 2000000, Size: 65536},
 	}
 
-	err = validateIDMappings(spec, ipcLib.StandardSubid)
+	err = validateIDMappings(spec)
 	if err == nil {
 		t.Errorf("validateIDMappings(): expected failure due to non-matching uid & gid mappings, but it passed")
 	}
@@ -766,7 +648,7 @@ func TestValidateIDMappings(t *testing.T) {
 		{ContainerID: 0, HostID: 2000000, Size: 65536},
 	}
 
-	err = validateIDMappings(spec, ipcLib.StandardSubid)
+	err = validateIDMappings(spec)
 	if err == nil {
 		t.Errorf("validateIDMappings(): expected failure due to uid mapping to host ID 0, but it passed")
 	}
@@ -780,7 +662,7 @@ func TestValidateIDMappings(t *testing.T) {
 		{ContainerID: 0, HostID: 0, Size: 65536},
 	}
 
-	err = validateIDMappings(spec, ipcLib.StandardSubid)
+	err = validateIDMappings(spec)
 	if err == nil {
 		t.Errorf("validateIDMappings(): expected failure due to gid mapping to host ID 0, but it passed")
 	}
@@ -792,7 +674,7 @@ func TestValidateIDMappings(t *testing.T) {
 
 	spec.Linux.GIDMappings = spec.Linux.UIDMappings
 
-	err = validateIDMappings(spec, ipcLib.StandardSubid)
+	err = validateIDMappings(spec)
 	if err != nil {
 		t.Errorf("validateIDMappings(): expected pass but it failed; mapping = %v", spec.Linux.UIDMappings)
 	}
@@ -807,7 +689,7 @@ func TestValidateIDMappings(t *testing.T) {
 	spec.Linux.GIDMappings = spec.Linux.UIDMappings
 	origMapping := spec.Linux.UIDMappings
 
-	err = validateIDMappings(spec, ipcLib.StandardSubid)
+	err = validateIDMappings(spec)
 	if err != nil {
 		t.Errorf("validateIDMappings(): expected pass but it failed; mapping = %v", origMapping)
 	}
@@ -824,20 +706,6 @@ func TestValidateIDMappings(t *testing.T) {
 	if !equalIDMappings(want, spec.Linux.GIDMappings) {
 		t.Errorf("validateIDMappings(): gid mappings are not correct; want %v, got %v",
 			want, spec.Linux.GIDMappings)
-	}
-}
-
-func TestValidateNestedIdentityMappings(t *testing.T) {
-	spec := &specs.Spec{Linux: &specs.Linux{
-		UIDMappings: []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: IdRangeMin}},
-		GIDMappings: []specs.LinuxIDMapping{{ContainerID: 0, HostID: 0, Size: IdRangeMin}},
-	}}
-	if err := validateIDMappings(spec, ipcLib.NestedIdentity); err != nil {
-		t.Fatalf("valid nested identity mapping rejected: %v", err)
-	}
-	spec.Linux.UIDMappings[0].Size--
-	if err := validateIDMappings(spec, ipcLib.NestedIdentity); err == nil {
-		t.Fatal("short nested identity mapping accepted")
 	}
 }
 

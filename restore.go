@@ -123,9 +123,6 @@ using the sysbox-runc checkpoint command.`,
 		withFs := !context.GlobalBool("no-sysbox-fs")
 
 		sysbox := sysbox.NewSysbox(id, withMgr, withFs)
-		if err = sysbox.Mgr.SetMappingMode(context.GlobalString("mapping-mode")); err != nil {
-			return err
-		}
 
 		// register with sysMgr (registration with sysFs occurs later (within libcontainer))
 		if sysbox.Mgr.Enabled() {

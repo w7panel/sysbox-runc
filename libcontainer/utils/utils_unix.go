@@ -4,7 +4,6 @@
 package utils
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -166,19 +165,9 @@ func WithProcfd(root, unsafePath string, fn func(procfd string) error) error {
 	}
 	defer fh.Close()
 
-	threadProcfd := filepath.Join(procSelfFd, strconv.Itoa(int(fh.Fd())))
-	selfProcfd := filepath.Join("/proc/self/fd", strconv.Itoa(int(fh.Fd())))
+	procfd := filepath.Join(procSelfFd, strconv.Itoa(int(fh.Fd())))
 
-	// Use thread-self to retain its thread-pinning semantics for validation,
-	// but pass self/fd to mount(2). A freshly attached nested procfs can resolve
-	// thread-self during readlink yet return ENOENT when mount follows it. Go
-	// threads share the process fd table, so both paths reference the same
-	// already-opened O_PATH descriptor.
-	realpath, err := os.Readlink(threadProcfd)
-	procfd := selfProcfd
-	if errors.Is(err, os.ErrNotExist) {
-		realpath, err = os.Readlink(selfProcfd)
-	}
+	realpath, err := os.Readlink(procfd)
 	if err != nil {
 		return fmt.Errorf("procfd verification failed: %w", err)
 	}

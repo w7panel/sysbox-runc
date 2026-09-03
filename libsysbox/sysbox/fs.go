@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/nestybox/sysbox-ipc/sysboxFsGrpc"
-	ipcLib "github.com/nestybox/sysbox-ipc/sysboxMgrLib"
 	unixIpc "github.com/nestybox/sysbox-ipc/unix"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -40,12 +39,11 @@ type FsRegInfo struct {
 }
 
 type Fs struct {
-	Active      bool
-	Id          string // container-id
-	PreReg      bool   // indicates if the container was pre-registered with sysbox-fs
-	Reg         bool   // indicates if sys container was registered with sysbox-fs
-	Mountpoint  string // sysbox-fs FUSE mountpoint
-	MappingMode ipcLib.MappingMode
+	Active     bool
+	Id         string // container-id
+	PreReg     bool   // indicates if the container was pre-registered with sysbox-fs
+	Reg        bool   // indicates if sys container was registered with sysbox-fs
+	Mountpoint string // sysbox-fs FUSE mountpoint
 }
 
 func NewFs(id string, enable bool) *Fs {
@@ -71,16 +69,14 @@ func (fs *Fs) GetConfig() error {
 }
 
 // Pre-registers container with sysbox-fs.
-func (fs *Fs) PreRegister(linuxNamespaces []specs.LinuxNamespace, mappingMode ipcLib.MappingMode) error {
+func (fs *Fs) PreRegister(linuxNamespaces []specs.LinuxNamespace) error {
 	if fs.PreReg {
 		return fmt.Errorf("container %v already pre-registered", fs.Id)
 	}
 
 	data := &sysboxFsGrpc.ContainerData{
-		Id:          fs.Id,
-		MappingMode: uint32(mappingMode),
+		Id: fs.Id,
 	}
-	fs.MappingMode = mappingMode
 
 	// If the new container is entering an existing net-ns, pass the ns info to
 	// sysbox-fs; containers which share the same net-ns see a common view of
@@ -122,7 +118,6 @@ func (fs *Fs) Register(info *FsRegInfo) error {
 		GidSize:       int32(info.IdSize),
 		ProcRoPaths:   info.ProcRoPaths,
 		ProcMaskPaths: info.ProcMaskPaths,
-		MappingMode:   uint32(fs.MappingMode),
 	}
 
 	if err := sysboxFsGrpc.SendContainerRegistration(data); err != nil {
@@ -140,9 +135,8 @@ func (fs *Fs) SendCreationTime(t time.Time) error {
 		return fmt.Errorf("must register container %v before", fs.Id)
 	}
 	data := &sysboxFsGrpc.ContainerData{
-		Id:          fs.Id,
-		Ctime:       t,
-		MappingMode: uint32(fs.MappingMode),
+		Id:    fs.Id,
+		Ctime: t,
 	}
 	if err := sysboxFsGrpc.SendContainerUpdate(data); err != nil {
 		return fmt.Errorf("failed to send creation time to sysbox-fs: %v", err)

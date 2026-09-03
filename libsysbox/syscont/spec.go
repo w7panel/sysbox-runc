@@ -48,13 +48,11 @@ const (
 
 // Internal
 const (
-	defaultUid                  uint32 = 231072
-	defaultGid                  uint32 = 231072
-	fuseDevicePath                     = "/dev/fuse"
-	fuseDeviceMajor             int64  = 10
-	fuseDeviceMinor             int64  = 229
-	allowProcExecAnnotation            = "sysbox/allow-proc-exec"
-	skipSpecialMountsAnnotation        = "sysbox/skip-special-mounts"
+	defaultUid      uint32 = 231072
+	defaultGid      uint32 = 231072
+	fuseDevicePath         = "/dev/fuse"
+	fuseDeviceMajor int64  = 10
+	fuseDeviceMinor int64  = 229
 )
 
 var (
@@ -347,6 +345,7 @@ func cfgNamespaces(sysMgr *sysbox.Mgr, spec *specs.Spec) error {
 	for _, ns := range allNs {
 		allNsSet.Add(ns)
 	}
+
 	reqNsSet := mapset.NewSet[string]()
 	for _, ns := range reqNs {
 		reqNsSet.Add(ns)
@@ -354,10 +353,6 @@ func cfgNamespaces(sysMgr *sysbox.Mgr, spec *specs.Spec) error {
 
 	specNsSet := mapset.NewSet[string]()
 	for _, ns := range spec.Linux.Namespaces {
-		if sysMgr.Config != nil && sysMgr.Config.MappingMode == ipcLib.NestedIdentity &&
-			ns.Type == specs.UserNamespace && ns.Path != "" {
-			return fmt.Errorf("nested-identity containers must create a new user namespace")
-		}
 		specNsSet.Add(string(ns.Type))
 	}
 	hadTimeNs := specNsSet.Contains(string(specs.TimeNamespace))
@@ -401,6 +396,7 @@ func cfgNamespaces(sysMgr *sysbox.Mgr, spec *specs.Spec) error {
 			spec.Linux.Namespaces = updatedNs
 		}
 	}
+
 	return nil
 }
 
@@ -493,7 +489,7 @@ func allocIDMappings(sysMgr *sysbox.Mgr, spec *specs.Spec) error {
 
 // validateIDMappings checks if the spec's user namespace uid and gid mappings meet
 // sysbox-runc requirements.
-func validateIDMappings(spec *specs.Spec, mappingMode ipcLib.MappingMode) error {
+func validateIDMappings(spec *specs.Spec) error {
 	var err error
 
 	if len(spec.Linux.UIDMappings) == 0 || len(spec.Linux.GIDMappings) == 0 {
@@ -535,14 +531,6 @@ func validateIDMappings(spec *specs.Spec, mappingMode ipcLib.MappingMode) error 
 			uidMap, gidMap)
 	}
 
-	if mappingMode == ipcLib.NestedIdentity {
-		if uidMap.ContainerID != 0 || uidMap.HostID != 0 || uidMap.Size != IdRangeMin ||
-			gidMap.ContainerID != 0 || gidMap.HostID != 0 || gidMap.Size != IdRangeMin {
-			return fmt.Errorf("nested-identity requires uid/gid mapping 0:0:%d", IdRangeMin)
-		}
-		return nil
-	}
-
 	if uidMap.HostID == 0 {
 		return fmt.Errorf("detected user-ns uid mapping to host ID 0 (%v); this breaks container isolation",
 			uidMap)
@@ -577,7 +565,7 @@ func cfgIDMappings(sysMgr *sysbox.Mgr, spec *specs.Spec) error {
 		return allocIDMappings(sysMgr, spec)
 	}
 
-	return validateIDMappings(spec, sysMgr.Config.MappingMode)
+	return validateIDMappings(spec)
 }
 
 // cfgCapabilities sets the capabilities for the process in the system container
@@ -653,14 +641,6 @@ func cfgMounts(spec *specs.Spec, sysbox *sysbox.Sysbox) error {
 
 	// We will modify the container's mounts; remember the original ones
 	sysbox.OrigMounts = spec.Mounts
-	// Nested K3s uses the outer Sysbox container as a runtime boundary. The
-	// CRI v2 path can lose annotations before OCI conversion, so normalize
-	// the incoming proc mount before any Sysbox mount branch can replace it.
-	for i := range spec.Mounts {
-		if filepath.Clean(spec.Mounts[i].Destination) == "/proc" {
-			spec.Mounts[i].Options = utils.StringSliceRemove(spec.Mounts[i].Options, []string{"noexec"})
-		}
-	}
 	if err := initializePVCVolumes(sysbox, spec); err != nil {
 		return err
 	}
@@ -670,7 +650,7 @@ func cfgMounts(spec *specs.Spec, sysbox *sysbox.Sysbox) error {
 		ensureFuseDeviceAccess(spec)
 	}
 
-	if sysFs.Enabled() && sysMgr.Config.MappingMode != ipcLib.NestedIdentity {
+	if sysFs.Enabled() {
 		cfgSysboxfsMounts(spec, sysFs)
 	}
 
@@ -685,16 +665,6 @@ func cfgMounts(spec *specs.Spec, sysbox *sysbox.Sysbox) error {
 		hasSystemd = true
 		cfgSystemdMounts(spec)
 	}
-
-	// cfgSyscontMounts and cfgSystemdMounts may replace the /proc mount;
-	// apply the explicit nested-K3s proc-exec opt-in after all mount injection.
-	// This must not be gated by SyscontMode: the outer K3s sandbox can carry
-	// the opt-in annotation while using the regular (non-system-container)
-	// Sysbox path, and its CNI helper still executes /proc/self/exe.
-	// Sysbox containers are the explicit PoC boundary for nested K3s. CRI
-	// v2 may drop the annotation before OCI conversion, so apply the proc
-	// execution requirement at the final Sysbox mount stage.
-	cfgProcExec(spec, true)
 
 	sortMounts(spec, hasSystemd)
 
@@ -795,46 +765,8 @@ func cfgSyscontMounts(sysMgr *sysbox.Mgr, spec *specs.Spec) {
 		return
 	}
 
-	// Add sysbox's default syscont mounts. The proc-exec opt-in must be
-	// applied to this source list before it is appended; later conversion
-	// paths may retain the appended mount slice and bypass a post-pass.
-	mounts := append([]specs.Mount(nil), syscontMounts...)
-	if spec.Annotations != nil && spec.Annotations[allowProcExecAnnotation] == "true" {
-		for i := range mounts {
-			if filepath.Clean(mounts[i].Destination) == "/proc" && mounts[i].Type == "proc" {
-				mounts[i].Options = utils.StringSliceRemove(mounts[i].Options, []string{"noexec"})
-			}
-		}
-	}
-	spec.Mounts = append(spec.Mounts, mounts...)
-}
-
-// cfgProcExec permits executable procfs only for an explicitly opted-in
-// nested-K3s experiment. Its CNI namespace helper executes /proc/self/exe.
-func cfgProcExec(spec *specs.Spec, syscontMode bool) {
-	annotationEnabled := spec.Annotations != nil && spec.Annotations[allowProcExecAnnotation] == "true"
-	// The nested runtime wrapper is launched by an inner containerd whose
-	// sandbox annotation forwarding is not guaranteed. Keep the escape hatch
-	// explicit and scoped to that wrapper's process environment.
-	envEnabled := os.Getenv("SYSBOX_ALLOW_PROC_EXEC") == "true"
-	if !annotationEnabled && !envEnabled && !syscontMode {
-		return
-	}
-	foundProc := false
-	for i := range spec.Mounts {
-		if filepath.Clean(spec.Mounts[i].Destination) == "/proc" {
-			foundProc = true
-			spec.Mounts[i].Options = utils.StringSliceRemove(spec.Mounts[i].Options, []string{"noexec"})
-		}
-	}
-	if !foundProc {
-		spec.Mounts = append(spec.Mounts, specs.Mount{
-			Destination: "/proc",
-			Type:        "proc",
-			Source:      "proc",
-			Options:     []string{"nosuid", "nodev"},
-		})
-	}
+	// Add sysbox's default syscont mounts
+	spec.Mounts = append(spec.Mounts, syscontMounts...)
 }
 
 // cfgSyscontMountsReadOnly adjusts the RW/RO character of syscont mounts in
@@ -1170,15 +1102,6 @@ func isCRIImageVolumeMount(m specs.Mount) bool {
 // /var/lib/docker, /var/lib/kubelet, etc. in order to enable system software to
 // run in the container seamlessly).
 func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
-	// Kubernetes CRI does not preserve arbitrary OCI annotations reliably. The
-	// dedicated nested runtime therefore conveys explicit opt-outs through its
-	// wrapper environment. Nested-identity itself must retain Sysbox's implicit
-	// special-directory mounts: with NoShift these are safe identity bind mounts,
-	// and they keep Docker's overlay upper/work directories off the FUSE rootfs.
-	if (spec.Annotations != nil && spec.Annotations[skipSpecialMountsAnnotation] == "true") ||
-		os.Getenv("SYSBOX_SKIP_SPECIAL_MOUNTS") == "true" {
-		return nil
-	}
 
 	rootfsUidShiftType := sysbox.RootfsUidShiftType
 	mgr := sysbox.Mgr
@@ -1207,7 +1130,7 @@ func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
 
 		if m.Type == "bind" {
 			if source, persistent := persistentSpecialMounts[filepath.Clean(m.Destination)]; persistent && filepath.Clean(m.Source) == filepath.Clean(source) {
-				if err := validatePersistentSpecialIDMapMount(sysbox.BindMntUidShiftType, mgr.Config.MappingMode, m); err != nil {
+				if err := validatePersistentSpecialIDMapMount(sysbox.BindMntUidShiftType, m); err != nil {
 					return err
 				}
 				delete(specialDirMap, m.Destination)
@@ -1226,11 +1149,8 @@ func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
 		}
 	}
 
-	uid, gid := uint32(0), uint32(0)
-	if len(spec.Linux.UIDMappings) > 0 {
-		uid = spec.Linux.UIDMappings[0].HostID
-		gid = spec.Linux.GIDMappings[0].HostID
-	}
+	uid := spec.Linux.UIDMappings[0].HostID
+	gid := spec.Linux.GIDMappings[0].HostID
 
 	if len(prepList) > 0 {
 		if err := mgr.PrepMounts(uid, gid, prepList); err != nil {
@@ -1286,10 +1206,7 @@ func sysMgrSetupMounts(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
 	return nil
 }
 
-func validatePersistentSpecialIDMapMount(shiftType sh.IDShiftType, mappingMode ipcLib.MappingMode, mount specs.Mount) error {
-	if mappingMode == ipcLib.NestedIdentity && shiftType == sh.NoShift {
-		return nil
-	}
+func validatePersistentSpecialIDMapMount(shiftType sh.IDShiftType, mount specs.Mount) error {
 	if shiftType != sh.IDMappedMount && shiftType != sh.IDMappedMountOrShiftfs {
 		return fmt.Errorf("persistent special mount %s requires idmapped mounts", mount.Destination)
 	}
@@ -1705,20 +1622,19 @@ func ConvertSpec(context *cli.Context, spec *specs.Spec, sbox *sysbox.Sysbox) er
 	if err := checkSpec(spec); err != nil {
 		return fmt.Errorf("invalid or unsupported container spec: %v", err)
 	}
+
 	if err := cfgNamespaces(sysMgr, spec); err != nil {
 		return fmt.Errorf("invalid or unsupported container spec: %v", err)
 	}
 
-	rootfsUidShiftType, bindMntUidShiftType := sh.NoShift, sh.NoShift
-	var err error
 	if err := cfgIDMappings(sysMgr, spec); err != nil {
 		return fmt.Errorf("invalid user/group ID config: %v", err)
 	}
-	if sysMgr.Config.MappingMode != ipcLib.NestedIdentity {
-		rootfsUidShiftType, bindMntUidShiftType, err = sysbox.CheckUidShifting(sysMgr, spec)
-		if err != nil {
-			return err
-		}
+
+	// Must do this after cfgIDMappings()
+	rootfsUidShiftType, bindMntUidShiftType, err := sysbox.CheckUidShifting(sysMgr, spec)
+	if err != nil {
+		return err
 	}
 
 	rootfsCloned := false

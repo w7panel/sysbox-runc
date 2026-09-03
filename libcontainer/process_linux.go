@@ -291,18 +291,6 @@ type initProcess struct {
 	sharePidns      bool
 }
 
-// nestedParentTrace is intentionally limited to the command-mode nested
-// runtime. It provides an on-node synchronization trace without changing the
-// normal Sysbox runtime's logging behavior.
-func nestedParentTrace(stage string) {
-	f, err := os.OpenFile("/var/log/sysbox-runc-inner-parent.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = f.WriteString(stage + "\n")
-}
-
 func (p *initProcess) pid() int {
 	return p.cmd.Process.Pid
 }
@@ -315,14 +303,7 @@ func (p *initProcess) externalDescriptors() []string {
 func (p *initProcess) getChildPid() (int, error) {
 	var pid pid
 	if err := json.NewDecoder(p.messageSockPair.parent).Decode(&pid); err != nil {
-		nestedParentTrace(fmt.Sprintf("pidDecodeError=%v", err))
-		if p.cmd != nil && p.cmd.Process != nil {
-			if waitErr := p.cmd.Wait(); waitErr != nil {
-				nestedParentTrace(fmt.Sprintf("nsexecExit=%v", waitErr))
-			} else if p.cmd.ProcessState != nil {
-				nestedParentTrace(fmt.Sprintf("nsexecExit=%s", p.cmd.ProcessState.String()))
-			}
-		}
+		p.cmd.Wait()
 		return -1, err
 	}
 
@@ -360,11 +341,6 @@ func (p *initProcess) start() (retErr error) {
 	defer p.messageSockPair.parent.Close()
 	err := p.cmd.Start()
 	p.process.ops = p
-	// The nested command mode has no use for the parent's copy after fork. The
-	// child received its own O_PATH descriptor through ExtraFiles.
-	if p.config.Config.SkipSpecialMounts && len(p.cmd.ExtraFiles) > 0 {
-		_ = p.cmd.ExtraFiles[len(p.cmd.ExtraFiles)-1].Close()
-	}
 	// close the write-side of the pipes (controlled by child)
 	p.messageSockPair.child.Close()
 	p.logFilePair.child.Close()
@@ -445,19 +421,6 @@ func (p *initProcess) start() (retErr error) {
 			return newSystemErrorWithCause(err, "applying cgroup configuration for process")
 		}
 	}
-	// In nested-identity mode, place the init in the delegated cgroup before it
-	// creates its cgroup namespace. This makes sysbox.delegate (rather than the
-	// hidden limit parent) the namespace root. The process moves to init.scope
-	// after rootfs setup, before controllers are enabled.
-	if p.config.Config.NestedIdentity &&
-		(cgType == cgroups.Cgroup_v2_fs || cgType == cgroups.Cgroup_v2_systemd) {
-		if err := p.manager.CreateChildCgroup(p.config.Config); err != nil {
-			return newSystemErrorWithCause(err, "creating nested container child cgroup")
-		}
-		if err := p.manager.ApplyChildCgroup(childPid); err != nil {
-			return newSystemErrorWithCause(err, "applying nested container child cgroup")
-		}
-	}
 
 	if p.intelRdtManager != nil {
 		if err := p.intelRdtManager.Apply(childPid); err != nil {
@@ -477,29 +440,12 @@ func (p *initProcess) start() (retErr error) {
 		return newSystemErrorWithCause(err, "waiting for our first child to exit")
 	}
 
-	if p.config.Config.NestedNetwork {
-		if err := setupNestedNetwork(p.config.Config.Namespaces.PathOf(configs.NEWNET), childPid); err != nil {
-			return newSystemErrorWithCause(err, "setting up nested network namespace")
-		}
-	}
-
 	if err := p.createNetworkInterfaces(); err != nil {
 		return newSystemErrorWithCause(err, "creating network interfaces")
 	}
 
 	if err := p.updateSpecState(); err != nil {
 		return newSystemErrorWithCause(err, "updating the spec state")
-	}
-
-	// Nested init needs a private procfs before the rest of rootfs setup can use
-	// procfd mount helpers. Register it with sysbox-fs before sending the init
-	// config so the inherited seccomp-notify listener can service that first
-	// mount syscall in the L2 namespaces.
-	if p.config.Config.NestedIdentity {
-		if err := p.registerWithSysboxfs(childPid); err != nil {
-			return err
-		}
-		nestedParentTrace("registeredEarly")
 	}
 
 	if err := p.sendConfig(); err != nil {
@@ -514,9 +460,6 @@ func (p *initProcess) start() (retErr error) {
 	ierr := parseSync(p.messageSockPair.parent, func(sync *syncT) error {
 		switch sync.Type {
 		case procReady:
-			if p.config.Config.SkipSpecialMounts {
-				nestedParentTrace("procReady")
-			}
 			// set rlimits, this has to be done here because we lose permissions
 			// to raise the limits once we enter a user-namespace
 			if err := setupRlimits(p.config.Rlimits, p.pid()); err != nil {
@@ -565,9 +508,6 @@ func (p *initProcess) start() (retErr error) {
 			// runc-delete/stop, we should store the status before
 			// procRun sync.
 			state, uerr := p.container.updateState(p)
-			if p.config.Config.SkipSpecialMounts {
-				nestedParentTrace("stateUpdated")
-			}
 			if uerr != nil {
 				return newSystemErrorWithCause(err, "store init state")
 			}
@@ -577,41 +517,25 @@ func (p *initProcess) start() (retErr error) {
 			if err := writeSync(p.messageSockPair.parent, procRun); err != nil {
 				return newSystemErrorWithCause(err, "writing syncT 'run'")
 			}
-			if p.config.Config.SkipSpecialMounts {
-				nestedParentTrace("procRun")
-			}
 			sentRun = true
 
 		case rootfsReady:
-			if p.config.Config.SkipSpecialMounts {
-				nestedParentTrace("rootfsReady")
-			}
 			// Setup cgroup v2 child cgroup
 			if cgType == cgroups.Cgroup_v2_fs || cgType == cgroups.Cgroup_v2_systemd {
-				if !p.config.Config.NestedIdentity {
-					if err := p.manager.CreateChildCgroup(p.config.Config); err != nil {
-						return newSystemErrorWithCause(err, "creating container child cgroup")
-					}
+				if err := p.manager.CreateChildCgroup(p.config.Config); err != nil {
+					return newSystemErrorWithCause(err, "creating container child cgroup")
 				}
 				if err := p.manager.ApplyChildCgroup(childPid); err != nil {
 					return newSystemErrorWithCause(err, "applying cgroup configuration for process")
 				}
 			}
 			// Register container with sysbox-fs.
-			if !p.config.Config.NestedIdentity {
-				if err = p.registerWithSysboxfs(childPid); err != nil {
-					return err
-				}
-			}
-			if p.config.Config.SkipSpecialMounts {
-				nestedParentTrace("registered")
+			if err = p.registerWithSysboxfs(childPid); err != nil {
+				return err
 			}
 			// Sync with child.
 			if err := writeSync(p.messageSockPair.parent, rootfsReadyAck); err != nil {
 				return newSystemErrorWithCause(err, "writing syncT 'rootfsReadyAck'")
-			}
-			if p.config.Config.SkipSpecialMounts {
-				nestedParentTrace("rootfsReadyAck")
 			}
 
 		case procHooks:
@@ -725,19 +649,12 @@ func (p *initProcess) registerWithSysboxfs(childPid int) error {
 		}
 	}
 
-	uid, gid, idSize := 0, 0, 0
-	if len(c.config.UidMappings) > 0 && len(c.config.GidMappings) > 0 {
-		uid = c.config.UidMappings[0].HostID
-		gid = c.config.GidMappings[0].HostID
-		idSize = c.config.UidMappings[0].Size
-	}
-
 	info := &sysbox.FsRegInfo{
 		Hostname:      c.config.Hostname,
 		Pid:           childPid,
-		Uid:           uid,
-		Gid:           gid,
-		IdSize:        idSize,
+		Uid:           c.config.UidMappings[0].HostID,
+		Gid:           c.config.GidMappings[0].HostID,
+		IdSize:        c.config.UidMappings[0].Size,
 		ProcRoPaths:   procRoPaths,
 		ProcMaskPaths: procMaskPaths,
 	}

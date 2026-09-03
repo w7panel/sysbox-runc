@@ -4,13 +4,10 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"strings"
-	"time"
 
 	sysboxmount "github.com/nestybox/sysbox-libs/mount"
 	"github.com/opencontainers/runc/internals/pathrs"
 	"github.com/opencontainers/runc/libcontainer/apparmor"
-	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/keys"
 	"github.com/opencontainers/runc/libcontainer/seccomp"
@@ -30,50 +27,6 @@ type linuxStandardInit struct {
 	config        *initConfig
 }
 
-// mountNestedSpecialFilesystems mounts procfs and sysfs after the nested
-// container has registered with sysbox-fs. The mount syscalls are then caught
-// by the listener inherited from L1 and serviced by L0 sysbox-fs in the L2
-// namespaces. Doing this during prepareRootfs is too early: the L2 container
-// is not registered yet and direct mounts from the nested userns fail EPERM.
-func mountNestedSpecialFilesystems(config *configs.Config) error {
-	// Install sysfs first. The cgroup2 mountpoint lives below it and would be
-	// hidden if the order were reversed.
-	for _, m := range config.Mounts {
-		// procfs was mounted at the start of prepareRootfs because runc's
-		// procfd mount helpers require it. sysfs remains delayed until sysbox-fs
-		// registration has completed.
-		if m.Device != "sysfs" {
-			continue
-		}
-
-		dest := "/" + strings.TrimPrefix(m.Destination, "/")
-		if err := unix.Mount(m.Source, dest, m.Device, uintptr(m.Flags), m.Data); err != nil {
-			return errors.Wrapf(err, "mount nested %s at %s", m.Device, dest)
-		}
-		for _, pflag := range m.PropagationFlags {
-			if err := unix.Mount("", dest, "", uintptr(pflag), ""); err != nil {
-				return errors.Wrapf(err, "set nested %s propagation at %s", m.Device, dest)
-			}
-		}
-	}
-	for _, m := range config.Mounts {
-		if m.Device != "cgroup" || !cgroups.IsCgroup2UnifiedMode() {
-			continue
-		}
-
-		dest := "/" + strings.TrimPrefix(m.Destination, "/")
-		if err := mountFilesystemAtPath(dest, "cgroup2", m.Flags, m.Data); err != nil {
-			return errors.Wrapf(err, "mount nested cgroup2 at %s", dest)
-		}
-		for _, pflag := range m.PropagationFlags {
-			if err := setMountPropagationAtPath(dest, pflag); err != nil {
-				return errors.Wrapf(err, "set nested cgroup2 propagation at %s", dest)
-			}
-		}
-	}
-	return nil
-}
-
 // sysbox-runc: info passed when the sys container's init process requests its parent runc
 // to perform an operation on its behalf.
 type opReqType int
@@ -86,7 +39,6 @@ const (
 	rootfsIDMap
 	overlay
 	sysfs
-	procfs
 )
 
 type opReq struct {
@@ -97,8 +49,6 @@ type opReq struct {
 	Op                opReqType `json:"type"`
 	Rootfs            string    `json:"rootfs"`
 	FsuidMapFailOnErr bool      `json:"fsuid_map_fail_on_err"`
-	SkipSpecialMounts bool      `json:"skip_special_mounts"`
-	NestedIdentity    bool      `json:"nested_identity"`
 
 	// bind
 	Mount configs.Mount `json:"mount"`
@@ -211,17 +161,11 @@ func (l *linuxStandardInit) Init() error {
 	if err := apparmor.ApplyProfile(l.config.AppArmorProfile); err != nil {
 		return errors.Wrap(err, "apply apparmor profile")
 	}
+
 	// Notify rootfs readiness to parent so that sysbox-fs registration can be
 	// completed.
 	if err := syncParentRootfsReady(l.pipe); err != nil {
 		return errors.Wrap(err, "send immutable list to parent")
-	}
-	// nested-identity implies SkipSpecialMounts in specconv, so the two cannot
-	// be distinguished here; the delayed mount is the only procfs/sysfs path.
-	if l.config.Config.NestedIdentity {
-		if err := mountNestedSpecialFilesystems(l.config.Config); err != nil {
-			return err
-		}
 	}
 
 	// The instructions that follow and that precede the 'parentReady' signal
@@ -233,19 +177,15 @@ func (l *linuxStandardInit) Init() error {
 		}
 	}
 
-	// A nested command-mode system container has no mountable procfs/sysfs.
-	// Its kernel settings belong to the outer K3s Pod, so do not attempt to
-	// apply OCI sysctls through paths that deliberately do not exist.
-	if !l.config.Config.SkipSpecialMounts && !l.config.Config.NestedIdentity {
-		for key, value := range l.config.Config.Sysctl {
-			if err := writeSystemProperty(key, value); err != nil {
-				return errors.Wrapf(err, "write sysctl key %s", key)
-			}
+	// Config the sysctls
+	for key, value := range l.config.Config.Sysctl {
+		if err := writeSystemProperty(key, value); err != nil {
+			return errors.Wrapf(err, "write sysctl key %s", key)
 		}
 	}
 
 	// Handle read-only paths
-	if !l.config.Config.SkipSpecialMounts && len(l.config.Config.ReadonlyPaths) > 0 {
+	if len(l.config.Config.ReadonlyPaths) > 0 {
 		mounts, err := sysboxmount.GetMounts()
 		if err != nil {
 			return errors.Wrap(err, "getting mounts")
@@ -258,17 +198,15 @@ func (l *linuxStandardInit) Init() error {
 		}
 	}
 
-	if !l.config.Config.SkipSpecialMounts {
-		// Do mounts on top of sysbox-fs emulated paths (e.g., mount binfmt_misc on
-		// /proc/sys/fs/binfmt_misc). This has to be done after we've registered with
-		// sysbox-fs since the mountpoint is under a sysbox-fs emulated path.
-		if err := doMounts(l.config.Config, l.pipe, true); err != nil {
-			return errors.Wrap(err, "doing mounts on top of sysbox-fs")
-		}
+	// Do mounts on top of sysbox-fs emulated paths (e.g., mount binfmt_misc on
+	// /proc/sys/fs/binfmt_misc). This has to be done after we've registered with
+	// sysbox-fs since the mountpoint is under a sysbox-fs emulated path.
+	if err := doMounts(l.config.Config, l.pipe, true); err != nil {
+		return errors.Wrap(err, "doing mounts on top of sysbox-fs")
 	}
 
 	// Handle masked paths
-	if err := maskPaths(l.config.Config.MaskPaths, l.config.Config.MountLabel, l.config.Config.NestedIdentity); err != nil {
+	if err := maskPaths(l.config.Config.MaskPaths, l.config.Config.MountLabel); err != nil {
 		return err
 	}
 
@@ -357,6 +295,7 @@ func (l *linuxStandardInit) Init() error {
 			return err
 		}
 	}
+
 	// Close the pipe to signal that we have completed our init.
 	l.pipe.Close()
 
@@ -364,24 +303,13 @@ func (l *linuxStandardInit) Init() error {
 	// user process. We open it through /proc/self/fd/$fd, because the fd that
 	// was given to us was an O_PATH fd to the fifo itself. Linux allows us to
 	// re-open an O_PATH fd through /proc.
-	var fifoFile *os.File
-	if l.config.Config.SkipSpecialMounts {
-		fifoFile = l.fifoFile
-	} else {
-		fifoFile, err = pathrs.Reopen(l.fifoFile, unix.O_WRONLY|unix.O_CLOEXEC)
-		if err != nil {
-			return newSystemErrorWithCause(err, "reopen exec fifo")
-		}
+	fifoFile, err := pathrs.Reopen(l.fifoFile, unix.O_WRONLY|unix.O_CLOEXEC)
+	if err != nil {
+		return newSystemErrorWithCause(err, "reopen exec fifo")
 	}
 	defer fifoFile.Close()
 	if _, err := fifoFile.Write([]byte("0")); err != nil {
 		return newSystemErrorWithCausef(err, "write exec fifo %s", fifoFile.Name())
-	}
-	// An O_RDWR FIFO permits the nested init to write before runc start opens
-	// its read end. Retain it briefly so the start-side blocking open observes
-	// the writer and drains the byte before EOF.
-	if l.config.Config.SkipSpecialMounts {
-		time.Sleep(2 * time.Second)
 	}
 
 	// Close the O_PATH fifofd fd before exec because the kernel resets
@@ -390,9 +318,7 @@ func (l *linuxStandardInit) Init() error {
 	// N.B. the core issue itself (passing dirfds to the host filesystem) has
 	// since been resolved.
 	// https://github.com/torvalds/linux/blob/v4.9/fs/exec.c#L1290-L1318
-	if fifoFile != nil {
-		_ = fifoFile.Close()
-	}
+	_ = fifoFile.Close()
 	_ = l.fifoFile.Close()
 
 	// Load the seccomp syscall whitelist as close to execve as possible, so as few
@@ -420,10 +346,8 @@ func (l *linuxStandardInit) Init() error {
 	// Go runtime, we must not do any file operations after this point (otherwise
 	// the (*os.File) finaliser could close the wrong file). See CVE-2024-21626
 	// for more information as to why this protection is necessary.
-	if shouldCloseInternalFds(l.config.Config) {
-		if err := utils.UnsafeCloseFrom(l.config.PassedFilesCount + 3); err != nil {
-			return err
-		}
+	if err := utils.UnsafeCloseFrom(l.config.PassedFilesCount + 3); err != nil {
+		return err
 	}
 
 	if err := unix.Exec(name, l.config.Args[0:], os.Environ()); err != nil {

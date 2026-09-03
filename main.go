@@ -78,11 +78,6 @@ func main() {
 			Value: root,
 			Usage: "root directory for storage of container state (this should be located in tmpfs)",
 		},
-		cli.StringFlag{
-			Name:  "mapping-mode",
-			Value: "standard-subid",
-			Usage: "user namespace mapping mode (standard-subid or nested-identity)",
-		},
 		cli.BoolFlag{
 			Name:  "no-sysbox-fs",
 			Usage: "do not interact with sysbox-fs; meant for testing and debugging.",

@@ -562,40 +562,12 @@ func rsyncPersistentSpecialDir(source, destination string, uidMappings, gidMappi
 		args = append(args, "--groupmap="+gidMap)
 	}
 	args = append(args, source+string(filepath.Separator), destination+string(filepath.Separator))
-	output, err := exec.Command("rsync", args...).CombinedOutput()
-	if err == nil {
-		return nil
-	}
-
-	// Some minimal rsync builds (including the one shipped in the nested CKM
-	// image) accept -A/-X in the command line but are compiled without ACL or
-	// xattr support. Persistent special mounts must still be usable there: the
-	// ownership mapping and one-filesystem boundary remain enforced, while ACL
-	// and xattr preservation is best-effort. Retry only for this known capability
-	// failure; ordinary I/O or permission errors remain fatal.
-	if !rsyncMetadataUnsupported(string(output)) {
+	command := exec.Command("rsync", args...)
+	output, err := command.CombinedOutput()
+	if err != nil {
 		return fmt.Errorf("rsync failed: %w: %s", err, strings.TrimSpace(string(output)))
 	}
-	if removeErr := os.RemoveAll(destination); removeErr != nil {
-		return fmt.Errorf("rsync metadata fallback cleanup: %w", removeErr)
-	}
-	if mkdirErr := os.MkdirAll(destination, 0o755); mkdirErr != nil {
-		return fmt.Errorf("rsync metadata fallback staging: %w", mkdirErr)
-	}
-	compatArgs := append([]string{"-aH", "--numeric-ids", "--one-file-system"}, args[3:]...)
-	compatOutput, compatErr := exec.Command("rsync", compatArgs...).CombinedOutput()
-	if compatErr != nil {
-		return fmt.Errorf("rsync failed after metadata fallback: %w: %s", compatErr, strings.TrimSpace(string(compatOutput)))
-	}
 	return nil
-}
-
-func rsyncMetadataUnsupported(output string) bool {
-	text := strings.ToLower(output)
-	return strings.Contains(text, "acls are not supported") ||
-		strings.Contains(text, "xattrs are not supported") ||
-		strings.Contains(text, "acl support unavailable") ||
-		strings.Contains(text, "xattr support unavailable")
 }
 
 func persistentSpecialRsyncIDMaps(root string, uidMappings, gidMappings []specs.LinuxIDMapping) (string, string, error) {

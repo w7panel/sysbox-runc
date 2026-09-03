@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 
-	ipcLib "github.com/nestybox/sysbox-ipc/sysboxMgrLib"
 	"github.com/nestybox/sysbox-libs/dockerUtils"
 	"github.com/nestybox/sysbox-runc/internals/pathrs"
 	"github.com/opencontainers/runc/libcontainer"
@@ -320,7 +319,6 @@ func createContainer(context *cli.Context,
 		RootfsCloned:        sysbox.RootfsCloned,
 		FsuidMapFailOnErr:   sysMgr.Config.FsuidMapFailOnErr,
 		IDshiftIgnoreList:   sysbox.IDshiftIgnoreList,
-		NestedIdentity:      sysMgr.Config.MappingMode == ipcLib.NestedIdentity,
 	})
 	if err != nil {
 		return nil, err
@@ -328,19 +326,14 @@ func createContainer(context *cli.Context,
 
 	// sysbox-runc: For container's proper operation, collect from sysbox-mgr
 	// fsState to be added to container's rootfs.
-	if sysMgr.Enabled() && sysMgr.Config.MappingMode != ipcLib.NestedIdentity {
+	if sysMgr.Enabled() {
 		if err := sysMgrGetFsState(sysMgr, config); err != nil {
 			return nil, err
 		}
 	}
 
 	// sysbox-runc: setup sys container syscall trapping
-	// Nested L2 mounts must be authorized by the L2 user namespace itself.
-	// Installing another Sysbox notify filter here would send those calls to
-	// L1 sysbox-fs, whose helper is not the namespace owner and cannot safely
-	// perform them. L2 still inherits L1's outer listener, which explicitly
-	// continues nested procfs/sysfs calls in-kernel.
-	if sysFs.Enabled() && sysMgr.Config.MappingMode != ipcLib.NestedIdentity {
+	if sysFs.Enabled() {
 		if err := syscont.AddSyscallTraps(config); err != nil {
 			return nil, err
 		}

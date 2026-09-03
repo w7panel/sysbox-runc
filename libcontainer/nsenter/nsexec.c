@@ -84,7 +84,6 @@ struct nlconfig_t {
 
 	/* Rootless container settings. */
 	uint8_t is_rootless_euid;	/* boolean */
-	uint8_t nested_network; /* boolean */
 	char *uidmappath;
 	size_t uidmappath_len;
 	char *gidmappath;
@@ -136,7 +135,6 @@ static int logfd = -1;
 #define PARENT_MOUNT_ATTR  27294
 #define SHIFTFS_MOUNTS_ATTR 27295
 #define TIMENSOFFSET_ATTR   27296
-#define NESTED_NETWORK_ATTR 27297
 
 /*
  * Use the raw syscall for versions of glibc which don't include a function for
@@ -183,35 +181,8 @@ done:
 /* XXX: This is ugly. */
 static int syncfd = -1;
 
-/* The inner runtime deliberately runs in a user namespace where the normal
- * runc log pipe may not be available yet.  Keep a small opt-in diagnostic
- * breadcrumb on the L1 filesystem so failures before the bootstrap protocol
- * can still be diagnosed. */
-static void nested_trace(const char *fmt, ...)
-{
-	const char *path = getenv("_SYSBOX_NESTED_TRACE");
-	if (path == NULL || *path == '\0')
-		return;
-	int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-	if (fd < 0)
-		return;
-	char message[1024] = {};
-	va_list args;
-	va_start(args, fmt);
-	int n = vsnprintf(message, sizeof(message), fmt, args);
-	va_end(args);
-	if (n > 0) {
-		if (n > (int)sizeof(message) - 2)
-			n = sizeof(message) - 2;
-		message[n++] = '\n';
-		(void)write(fd, message, n);
-	}
-	close(fd);
-}
-
 #define bail(fmt, ...)                                       \
 	do {                                                       \
-		nested_trace("%s:%d: " fmt ": %s", __FUNCTION__, __LINE__, ##__VA_ARGS__, strerror(errno)); \
 		write_log(FATAL, "nsenter: " fmt ": %m", ##__VA_ARGS__); \
 		exit(1);                                                 \
 	} while(0)
@@ -610,9 +581,6 @@ static void nl_parse(int fd, struct nlconfig_t *config)
 			config->timensoffset = current;
 			config->timensoffset_len = payload_len;
 			break;
-		case NESTED_NETWORK_ATTR:
-			config->nested_network = readint8(current);
-			break;
 		default:
 			bail("unknown netlink message type %d", nlattr->nla_type);
 		}
@@ -674,28 +642,18 @@ void join_namespaces(char *nslist)
 	} while ((namespace = strtok_r(NULL, ",", &saveptr)) != NULL);
 
 	/*
-	 * Ordering matters here. Per setns(2), joining a namespace requires
-	 * CAP_SYS_ADMIN in the user namespace that owns it. Once we enter a
-	 * descendant user namespace we must not attempt to join any remaining
-	 * namespaces from its parent: the task's credentials may no longer have
-	 * the necessary capability there. Join netns first (for the usual runc
-	 * case), move userns to the end, and only then switch identity.
+	 * Ordering matters here. Per setns(2), joining the netns requires
+	 * CAP_SYS_ADMIN in the user namespace that owns it, which is the
+	 * host's, not the container's. Once we setns(2)/unshare(2) into the
+	 * container's user namespace, that host capability is gone for good
+	 * (user_namespaces(7)), so the netns join would then fail. Hence we
+	 * join the netns first and the user namespace last.
 	 */
 	for (i = 0; i < num; i++) {
 		if (namespaces[i].ns == CLONE_NEWNET && i > 0) {
 			struct namespace_t netns = namespaces[i];
 			memmove(&namespaces[1], &namespaces[0], i * sizeof(struct namespace_t));
 			namespaces[0] = netns;
-			break;
-		}
-	}
-
-	for (i = 0; i < num; i++) {
-		if (namespaces[i].ns == CLONE_NEWUSER && i != num - 1) {
-			struct namespace_t userns = namespaces[i];
-			memmove(&namespaces[i], &namespaces[i + 1],
-				(num - i - 1) * sizeof(struct namespace_t));
-			namespaces[num - 1] = userns;
 			break;
 		}
 	}
@@ -1148,17 +1106,6 @@ void nsexec(void)
 
 				if (mount(".", ".", "bind", MS_BIND|MS_REC, "") < 0)
 					bail("failed to create bind-to-self mount on rootfs.");
-			}
-
-			/*
-			 * CNI creates the sandbox netns before runc creates the child
-			 * userns. Create the working netns after the child mapping is set;
-			 * the L1 runc parent migrates the CNI interfaces into it.
-			 */
-			if (config.nested_network) {
-				if (!new_userns)
-					bail("nested network requires a new user namespace");
-				config.cloneflags |= CLONE_NEWNET;
 			}
 
 			if (config.prep_rootfs && !shiftfs_mounts_done) {
