@@ -29,6 +29,28 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
+func TestMountProcPressure(t *testing.T) {
+	osRelease, err := os.CreateTemp(t.TempDir(), "os-release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := osRelease.WriteString("ID=centos\nVERSION_ID=\"9\"\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := osRelease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if mountProcPressureFromFile(osRelease.Name()) {
+		t.Fatal("mountProcPressure() = true, want false for CentOS Stream 9")
+	}
+	if err := os.WriteFile(osRelease.Name(), []byte("ID=ubuntu\nVERSION_ID=\"24.04\"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !mountProcPressureFromFile(osRelease.Name()) {
+		t.Fatal("mountProcPressure() = false, want true for Ubuntu")
+	}
+}
+
 func findSeccompSyscall(seccomp *specs.LinuxSeccomp, targetSyscalls []string) (allFound bool, notFound []string) {
 	if seccomp == nil {
 		return false, notFound

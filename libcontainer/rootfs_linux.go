@@ -1245,7 +1245,11 @@ func maskPaths(paths []string, mountLabel string) error {
 // For e.g. net.ipv4.ip_forward translated to /proc/sys/net/ipv4/ip_forward.
 func writeSystemProperty(key, value string) error {
 	keyPath := strings.Replace(key, ".", "/", -1)
-	return ioutil.WriteFile(path.Join("/proc/sys", keyPath), []byte(value), 0644)
+	err := ioutil.WriteFile(path.Join("/proc/sys", keyPath), []byte(value), 0644)
+	if (key == "net.ipv4.ip_unprivileged_port_start" || key == "net.ipv4.ping_group_range") && errors.Is(err, os.ErrPermission) {
+		return nil
+	}
+	return err
 }
 
 func remount(m *configs.Mount) error {
