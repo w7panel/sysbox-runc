@@ -346,10 +346,8 @@ func (l *linuxStandardInit) Init() error {
 	// Go runtime, we must not do any file operations after this point (otherwise
 	// the (*os.File) finaliser could close the wrong file). See CVE-2024-21626
 	// for more information as to why this protection is necessary.
-	if shouldCloseInternalFds(l.config.Config) {
-		if err := utils.UnsafeCloseFrom(l.config.PassedFilesCount + 3); err != nil {
-			return err
-		}
+	if err := utils.UnsafeCloseFrom(l.config.PassedFilesCount + 3); err != nil {
+		return err
 	}
 
 	if err := unix.Exec(name, l.config.Args[0:], os.Environ()); err != nil {

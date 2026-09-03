@@ -81,13 +81,6 @@ type initer interface {
 	Init() error
 }
 
-// Nested-identity containers provide a private procfs, so internal runtime
-// descriptors must be closed before handing control to the workload. Legacy
-// skip-special-mounts containers may not have procfs available.
-func shouldCloseInternalFds(config *configs.Config) bool {
-	return !config.SkipSpecialMounts || config.NestedIdentity
-}
-
 func newContainerInit(t initType, pipe *os.File, consoleSocket, fifoFile *os.File) (initer, error) {
 	if t == initStandard || t == initSetns {
 		var config *initConfig
@@ -182,10 +175,8 @@ func finalizeNamespace(config *initConfig) error {
 	// XXX: CloseExecFrom relies on the presence procfs being mounted inside the sys container.
 	// This means a setns entry into the sys container (e.g., via docker exec) would fail if
 	// /proc is not mounted in the container.
-	if shouldCloseInternalFds(config.Config) {
-		if err := utils.CloseExecFrom(config.PassedFilesCount + 3); err != nil {
-			return errors.Wrap(err, "close exec fds")
-		}
+	if err := utils.CloseExecFrom(config.PassedFilesCount + 3); err != nil {
+		return errors.Wrap(err, "close exec fds")
 	}
 
 	capabilities := &configs.Capabilities{}
