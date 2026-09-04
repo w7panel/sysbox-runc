@@ -1258,6 +1258,9 @@ func getSysboxEnvVarConfigs(p *specs.Process, sbox *sysbox.Sysbox) error {
 		"SYSBOX_HONOR_CAPS":          "bool",
 		"SYSBOX_SYSCONT_MODE":        "bool",
 		"SYSBOX_SKIP_UID_SHIFT":      "string",
+		// SYSBOX_VERSION is embedded by the Sysbox deployment image and is
+		// informational; accept it without applying runtime configuration.
+		"SYSBOX_VERSION":              "string",
 	}
 
 	for _, ev := range p.Env {
