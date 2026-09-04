@@ -1261,6 +1261,10 @@ func getSysboxEnvVarConfigs(p *specs.Process, sbox *sysbox.Sysbox) error {
 		// SYSBOX_VERSION is embedded by the Sysbox deployment image and is
 		// informational; accept it without applying runtime configuration.
 		"SYSBOX_VERSION":              "string",
+		// Inner CKM launcher controls are consumed by the image entrypoint.
+		// They are informational to the outer runtime and must pass through.
+		"SYSBOX_INNER_START_DAEMONS":  "string",
+		"SYSBOX_INNER_LOG_DIR":        "string",
 	}
 
 	for _, ev := range p.Env {
