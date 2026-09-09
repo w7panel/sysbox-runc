@@ -4,10 +4,8 @@ package syscont
 
 import (
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,16 +19,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const (
-	volumeInitAnnotation = "sysbox/volume-init"
-	volumeInitStateDir   = "/run/sysbox/pvc-volume-init"
-)
-
-type volumeInitEntry struct {
-	Name       string `json:"name"`
-	VolumeName string `json:"volumeName"`
-	MountPath  string `json:"mountPath"`
-}
+const volumeInitStateDir = "/run/sysbox/pvc-volume-init"
 
 func initializePVCVolumes(sysbox *sysbox.Sysbox, spec *specs.Spec) error {
 	return initializePVCVolumesAtWithState(spec, kubeletPodsDir, volumeInitStateDir, sysbox.BindMntUidShiftType, true)
@@ -44,10 +33,6 @@ func initializePVCVolumesAtWithState(spec *specs.Spec, podsDir, stateDir string,
 	if spec == nil || spec.Root == nil || spec.Root.Path == "" {
 		return fmt.Errorf("container rootfs is missing")
 	}
-	raw := spec.Annotations[volumeInitAnnotation]
-	if raw == "" {
-		return nil
-	}
 	containerName := spec.Annotations[kubernetesContainerNameAnno]
 	// CRI forwards Pod annotations to the sandbox OCI spec too. The sandbox has
 	// no Kubernetes container-name annotation and no application PVC mounts.
@@ -56,85 +41,35 @@ func initializePVCVolumesAtWithState(spec *specs.Spec, podsDir, stateDir string,
 	}
 	podUID := spec.Annotations[kubernetesSandboxUIDAnno]
 	if podUID == "" {
-		return fmt.Errorf("%s requires the Kubernetes Pod UID annotation", volumeInitAnnotation)
-	}
-	entries, err := decodeVolumeInitEntries(raw)
-	if err != nil {
-		return err
+		// Direct runc use has no Kubernetes context. Do not infer host paths.
+		return nil
 	}
 	rootfs, err := filepath.Abs(spec.Root.Path)
 	if err != nil {
 		return fmt.Errorf("resolve container rootfs: %w", err)
 	}
-	for _, entry := range entries {
-		if entry.Name != containerName {
+	for _, mount := range spec.Mounts {
+		if mount.Type != "bind" {
 			continue
 		}
-		mount, found := findVolumeInitMount(spec.Mounts, entry.MountPath)
-		if !found {
-			return fmt.Errorf("PVC volume %q mount %q is missing from OCI spec", entry.VolumeName, entry.MountPath)
-		}
-		if mount.Type != "bind" {
-			return fmt.Errorf("PVC volume %q mount %q is not a bind mount", entry.VolumeName, entry.MountPath)
-		}
 		if hasMountOption(mount.Options, "ro") {
-			return fmt.Errorf("PVC volume %q mount %q is unexpectedly read-only", entry.VolumeName, entry.MountPath)
+			continue
 		}
-		source, directory, err := validateAnnotatedPVCSource(mount.Source, podUID, containerName, entry.VolumeName, podsDir)
+		source, directory, ok, err := detectPVCSource(mount.Source, podUID, containerName, podsDir)
 		if err != nil {
 			return err
 		}
-		if !directory {
+		if !ok || !directory {
 			continue
 		}
 		mount.Source = source
-		stateKey := sha256.Sum256([]byte(source + "\x00" + entry.MountPath))
+		stateKey := sha256.Sum256([]byte(source + "\x00" + mount.Destination))
 		statePath := filepath.Join(stateDir, fmt.Sprintf("%x", stateKey))
 		if err := seedEmptyPVCVolume(rootfs, mount, statePath, spec.Linux, shiftType, requireIDMap); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func decodeVolumeInitEntries(raw string) ([]volumeInitEntry, error) {
-	decoder := json.NewDecoder(strings.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	var entries []volumeInitEntry
-	if err := decoder.Decode(&entries); err != nil {
-		return nil, fmt.Errorf("decode %s: %w", volumeInitAnnotation, err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("decode %s: trailing JSON data", volumeInitAnnotation)
-	}
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("%s must contain at least one entry", volumeInitAnnotation)
-	}
-	seen := make(map[string]struct{})
-	for _, entry := range entries {
-		if entry.Name == "" || entry.VolumeName == "" || !filepath.IsAbs(entry.MountPath) {
-			return nil, fmt.Errorf("%s contains an invalid entry", volumeInitAnnotation)
-		}
-		if strings.Contains(entry.VolumeName, string(filepath.Separator)) {
-			return nil, fmt.Errorf("%s contains an unsafe volume name", volumeInitAnnotation)
-		}
-		key := entry.Name + "\x00" + filepath.Clean(entry.MountPath)
-		if _, ok := seen[key]; ok {
-			return nil, fmt.Errorf("%s configures container mount %q more than once", volumeInitAnnotation, entry.MountPath)
-		}
-		seen[key] = struct{}{}
-	}
-	return entries, nil
-}
-
-func findVolumeInitMount(mounts []specs.Mount, destination string) (specs.Mount, bool) {
-	destination = filepath.Clean(destination)
-	for i := len(mounts) - 1; i >= 0; i-- {
-		if filepath.Clean(mounts[i].Destination) == destination {
-			return mounts[i], true
-		}
-	}
-	return specs.Mount{}, false
 }
 
 func hasMountOption(options []string, expected string) bool {
@@ -146,46 +81,58 @@ func hasMountOption(options []string, expected string) bool {
 	return false
 }
 
-func validateAnnotatedPVCSource(source, podUID, containerName, volumeName, podsDir string) (string, bool, error) {
+// detectPVCSource only accepts kubelet CSI volume paths belonging to this Pod.
+// This deliberately avoids initializing emptyDir, projected volumes, hostPath,
+// or an untrusted host bind mount without consulting the Kubernetes API.
+func detectPVCSource(source, podUID, containerName, podsDir string) (string, bool, bool, error) {
 	cleanSource, err := filepath.Abs(source)
 	if err != nil {
-		return "", false, fmt.Errorf("resolve PVC mount source: %w", err)
+		return "", false, false, fmt.Errorf("resolve PVC mount source: %w", err)
 	}
 	podRoot := filepath.Join(filepath.Clean(podsDir), podUID)
 	directRoot := filepath.Join(podRoot, "volumes")
 	if rel, relErr := filepath.Rel(directRoot, cleanSource); relErr == nil {
 		parts := strings.Split(rel, string(filepath.Separator))
-		if len(parts) >= 2 && parts[0] != "" && parts[1] != "" &&
-			(len(parts) == 2 || len(parts) == 3 && parts[2] == "mount") {
-			return validatePVCSource(cleanSource, volumeName)
+		if len(parts) == 3 && parts[0] == "kubernetes.io~csi" && parts[1] != "" && parts[2] == "mount" {
+			source, directory, err := validatePVCSource(cleanSource)
+			return source, directory, err == nil, err
 		}
 	}
 	subpathRoot := filepath.Join(podRoot, "volume-subpaths")
 	if rel, relErr := filepath.Rel(subpathRoot, cleanSource); relErr == nil {
 		parts := strings.Split(rel, string(filepath.Separator))
 		if len(parts) != 3 {
-			return "", false, fmt.Errorf("PVC volume %q source %q does not belong to the current Pod and container", volumeName, source)
+			return "", false, false, nil
 		}
 		// Kubelet may use the pod-spec container name for the volume-subpaths
 		// directory while CRI gives the runtime the generated container name
 		// (for example, "app" vs "app-54f8cb585c-gmz4v").
 		containerDir := parts[1]
 		containerMatches := containerDir == containerName || strings.HasPrefix(containerName, containerDir+"-")
-		volumeDirMatches := parts[0] == volumeName || strings.HasPrefix(parts[0], "pvc-")
+		volumeDirMatches := strings.HasPrefix(parts[0], "pvc-") || isCSIVolumeName(podRoot, parts[0])
 		if volumeDirMatches && containerDir != "" && containerMatches && parts[2] != "" {
-			return validatePVCSource(cleanSource, volumeName)
+			source, directory, err := validatePVCSource(cleanSource)
+			return source, directory, err == nil, err
 		}
 	}
-	return "", false, fmt.Errorf("PVC volume %q source %q does not belong to the current Pod and container", volumeName, source)
+	return "", false, false, nil
 }
 
-func validatePVCSource(source, volumeName string) (string, bool, error) {
+func isCSIVolumeName(podRoot, volumeName string) bool {
+	if volumeName == "" || strings.Contains(volumeName, string(filepath.Separator)) {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(podRoot, "volumes", "kubernetes.io~csi", volumeName, "mount"))
+	return err == nil
+}
+
+func validatePVCSource(source string) (string, bool, error) {
 	info, err := os.Lstat(source)
 	if err != nil {
-		return "", false, fmt.Errorf("stat PVC volume %q source: %w", volumeName, err)
+		return "", false, fmt.Errorf("stat PVC volume source: %w", err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return "", false, fmt.Errorf("PVC volume %q source %q is a symlink", volumeName, source)
+		return "", false, fmt.Errorf("PVC volume source %q is a symlink", source)
 	}
 	return source, info.IsDir(), nil
 }

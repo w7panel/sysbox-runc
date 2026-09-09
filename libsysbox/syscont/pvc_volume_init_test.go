@@ -12,14 +12,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func testVolumeInitSpec(rootfs, source, annotation string) *specs.Spec {
+func testVolumeInitSpec(rootfs, source, _ string) *specs.Spec {
 	return &specs.Spec{
 		Root:  &specs.Root{Path: rootfs},
 		Linux: &specs.Linux{},
 		Annotations: map[string]string{
 			kubernetesContainerNameAnno: "app",
 			kubernetesSandboxUIDAnno:    "pod-uid",
-			volumeInitAnnotation:        annotation,
 		},
 		Mounts: []specs.Mount{{Source: source, Destination: "/data", Type: "bind", Options: []string{"rw"}}},
 	}
@@ -119,6 +118,9 @@ func TestInitializePVCVolumesSupportsDirectorySubPath(t *testing.T) {
 	}
 	source := filepath.Join(podsDir, "pod-uid", "volume-subpaths", "data", "app", "0")
 	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(podsDir, "pod-uid", "volumes", "kubernetes.io~csi", "data", "mount"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	spec := testVolumeInitSpec(rootfs, source, `[{"name":"app","volumeName":"data","mountPath":"/data"}]`)
@@ -238,7 +240,7 @@ func TestInitializePVCVolumesSkipsFileImagePath(t *testing.T) {
 	}
 }
 
-func TestInitializePVCVolumesRejectsSourceFromAnotherPod(t *testing.T) {
+func TestInitializePVCVolumesSkipsSourceFromAnotherPod(t *testing.T) {
 	podsDir := t.TempDir()
 	rootfs := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(rootfs, "data"), 0o755); err != nil {
@@ -250,8 +252,11 @@ func TestInitializePVCVolumesRejectsSourceFromAnotherPod(t *testing.T) {
 	}
 	spec := testVolumeInitSpec(rootfs, source, `[{"name":"app","volumeName":"data","mountPath":"/data"}]`)
 
-	if err := initializePVCVolumesAt(spec, podsDir, sh.IDMappedMount, false); err == nil {
-		t.Fatal("expected source validation error")
+	if err := initializePVCVolumesAt(spec, podsDir, sh.IDMappedMount, false); err != nil {
+		t.Fatalf("foreign Pod mount must be skipped: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(source, "image.txt")); !os.IsNotExist(err) {
+		t.Fatalf("foreign Pod volume was initialized: %v", err)
 	}
 }
 
@@ -259,7 +264,7 @@ func TestInitializePVCVolumesSkipsPodSandbox(t *testing.T) {
 	spec := &specs.Spec{
 		Root:        &specs.Root{Path: t.TempDir()},
 		Linux:       &specs.Linux{},
-		Annotations: map[string]string{volumeInitAnnotation: `[{"name":"app","volumeName":"data","mountPath":"/data"}]`},
+		Annotations: map[string]string{},
 	}
 	if err := initializePVCVolumesAt(spec, t.TempDir(), sh.IDMappedMount, false); err != nil {
 		t.Fatalf("Pod sandbox must ignore volume initialization metadata: %v", err)
