@@ -1272,19 +1272,22 @@ func getSysboxEnvVarConfigs(p *specs.Process, sbox *sysbox.Sysbox) error {
 			continue
 		}
 
-		tokens := strings.Split(ev, "=")
+		tokens := strings.SplitN(ev, "=", 2)
+		evName := tokens[0]
+
+		// Kubernetes generates SERVICE_* variables from Service names. A Service
+		// named sysbox-runtime-relay therefore produces SYSBOX_RUNTIME_RELAY_*
+		// variables in every Pod. Only consume the explicit runtime controls and
+		// leave other SYSBOX_* variables untouched for the workload.
+		envVarType, ok := knownEnvVars[evName]
+		if !ok {
+			continue
+		}
 		if len(tokens) != 2 {
 			return fmt.Errorf("env var %s has incorrect format; expected VAR=VALUE.", ev)
 		}
 
-		evName := tokens[0]
 		evVal := tokens[1]
-
-		// If a SYSBOX_* env var is specified, it must be one of the supported ones.
-		envVarType, ok := knownEnvVars[evName]
-		if !ok {
-			return fmt.Errorf("invalid env var %s; must be one of %v", evName, knownEnvVars)
-		}
 
 		switch envVarType {
 		case "bool":
