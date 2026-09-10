@@ -81,6 +81,29 @@ func TestInitializePVCVolumesAcceptsKubeletPVCSourceName(t *testing.T) {
 	}
 }
 
+func TestInitializePVCVolumesAcceptsK3sLocalPath(t *testing.T) {
+	podsDir := t.TempDir()
+	rootfs := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rootfs, "data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootfs, "data", "image.txt"), []byte("from-image"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(podsDir, "pod-uid", "volumes", "kubernetes.io~local-volume", "pvc-123")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spec := testVolumeInitSpec(rootfs, source, `[{'name':'app'}]`)
+
+	if err := initializePVCVolumesAt(spec, podsDir, sh.IDMappedMount, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(source, "image.txt")); err != nil || string(got) != "from-image" {
+		t.Fatalf("local-path initialized content = %q, err=%v", got, err)
+	}
+}
+
 func TestInitializePVCVolumesTreatsLostFoundAsEmpty(t *testing.T) {
 	podsDir := t.TempDir()
 	rootfs := t.TempDir()

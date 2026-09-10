@@ -81,7 +81,8 @@ func hasMountOption(options []string, expected string) bool {
 	return false
 }
 
-// detectPVCSource only accepts kubelet CSI volume paths belonging to this Pod.
+// detectPVCSource only accepts recognized kubelet PVC volume paths belonging to
+// this Pod: generic CSI paths and K3s local-path's in-tree local-volume path.
 // This deliberately avoids initializing emptyDir, projected volumes, hostPath,
 // or an untrusted host bind mount without consulting the Kubernetes API.
 func detectPVCSource(source, podUID, containerName, podsDir string) (string, bool, bool, error) {
@@ -97,6 +98,14 @@ func detectPVCSource(source, podUID, containerName, podsDir string) (string, boo
 			source, directory, err := validatePVCSource(cleanSource)
 			return source, directory, err == nil, err
 		}
+		// K3s local-path dynamically provisioned PVCs are surfaced via the
+		// kubelet's in-tree local-volume layout rather than the generic CSI
+		// layout. It is still per-Pod and kubelet-owned, so it has the same
+		// trust boundary as the CSI source above.
+		if len(parts) == 2 && parts[0] == "kubernetes.io~local-volume" && parts[1] != "" {
+			source, directory, err := validatePVCSource(cleanSource)
+			return source, directory, err == nil, err
+		}
 	}
 	subpathRoot := filepath.Join(podRoot, "volume-subpaths")
 	if rel, relErr := filepath.Rel(subpathRoot, cleanSource); relErr == nil {
@@ -109,7 +118,7 @@ func detectPVCSource(source, podUID, containerName, podsDir string) (string, boo
 		// (for example, "app" vs "app-54f8cb585c-gmz4v").
 		containerDir := parts[1]
 		containerMatches := containerDir == containerName || strings.HasPrefix(containerName, containerDir+"-")
-		volumeDirMatches := strings.HasPrefix(parts[0], "pvc-") || isCSIVolumeName(podRoot, parts[0])
+		volumeDirMatches := strings.HasPrefix(parts[0], "pvc-") || isPVCVolumeName(podRoot, parts[0])
 		if volumeDirMatches && containerDir != "" && containerMatches && parts[2] != "" {
 			source, directory, err := validatePVCSource(cleanSource)
 			return source, directory, err == nil, err
@@ -118,12 +127,19 @@ func detectPVCSource(source, podUID, containerName, podsDir string) (string, boo
 	return "", false, false, nil
 }
 
-func isCSIVolumeName(podRoot, volumeName string) bool {
+func isPVCVolumeName(podRoot, volumeName string) bool {
 	if volumeName == "" || strings.Contains(volumeName, string(filepath.Separator)) {
 		return false
 	}
-	_, err := os.Stat(filepath.Join(podRoot, "volumes", "kubernetes.io~csi", volumeName, "mount"))
-	return err == nil
+	for _, source := range []string{
+		filepath.Join(podRoot, "volumes", "kubernetes.io~csi", volumeName, "mount"),
+		filepath.Join(podRoot, "volumes", "kubernetes.io~local-volume", volumeName),
+	} {
+		if _, err := os.Stat(source); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func validatePVCSource(source string) (string, bool, error) {
