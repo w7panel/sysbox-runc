@@ -114,7 +114,11 @@ func cfgPersistentSpecialMountsTracked(spec *specs.Spec, podsDir, handoffDir, co
 			Source:      source,
 			Destination: mapping.Destination,
 			Type:        "bind",
-			Options:     []string{"rbind", "rprivate"},
+			// Persistent special mounts back nested kubelet-managed paths. Keep
+			// recursive propagation so mounts created below the special path are
+			// visible to the parent namespace without requiring a CKM startup
+			// script to change propagation globally.
+			Options: []string{"rbind", "rshared"},
 		})
 	}
 	spec.Mounts = filtered

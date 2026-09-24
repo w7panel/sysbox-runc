@@ -262,7 +262,7 @@ func TestCfgPersistentSpecialMountsInitializesAndReusesPVCStorage(t *testing.T) 
 		wantSource := filepath.Join(pvcRoot, "containers/app/special", strings.TrimPrefix(mapping.Destination, "/"))
 		if mount.Source != wantSource ||
 			mount.Destination != mapping.Destination || mount.Type != "bind" ||
-			!reflect.DeepEqual(mount.Options, []string{"rbind", "rprivate"}) {
+			!reflect.DeepEqual(mount.Options, []string{"rbind", "rshared"}) {
 			t.Fatalf("unexpected persistent mount: %#v", mount)
 		}
 	}
