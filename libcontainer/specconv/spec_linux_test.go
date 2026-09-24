@@ -1,9 +1,11 @@
+//go:build linux
 // +build linux
 
 package specconv
 
 import (
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -14,6 +16,19 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 )
+
+func TestParseMountOptionsRecursiveShared(t *testing.T) {
+	flags, propagation, data, extensionFlags := parseMountOptions([]string{"rbind", "rshared"})
+	if flags != unix.MS_BIND|unix.MS_REC {
+		t.Fatalf("mount flags = %#x, want %#x", flags, unix.MS_BIND|unix.MS_REC)
+	}
+	if want := []int{unix.MS_SHARED | unix.MS_REC}; !reflect.DeepEqual(propagation, want) {
+		t.Fatalf("propagation flags = %#v, want %#v", propagation, want)
+	}
+	if data != "" || extensionFlags != 0 {
+		t.Fatalf("unexpected mount option output: data=%q extensionFlags=%#x", data, extensionFlags)
+	}
+}
 
 func TestCreateCommandHookTimeout(t *testing.T) {
 	timeout := 3600
