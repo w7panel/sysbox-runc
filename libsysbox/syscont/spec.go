@@ -644,11 +644,14 @@ func cfgMounts(spec *specs.Spec, sysbox *sysbox.Sysbox) error {
 	if err := initializePVCVolumes(sysbox, spec); err != nil {
 		return err
 	}
+	if err := ensureFuseDeviceMount(spec, fuseDevicePath); err != nil {
+		return err
+	}
 
 	if sysMgr.Config.SyscontMode {
 		cfgSyscontMounts(sysMgr, spec)
-		ensureFuseDeviceAccess(spec)
 	}
+	ensureFuseDeviceAccess(spec)
 
 	if sysFs.Enabled() {
 		cfgSysboxfsMounts(spec, sysFs)
@@ -671,10 +674,31 @@ func cfgMounts(spec *specs.Spec, sysbox *sysbox.Sysbox) error {
 	return nil
 }
 
-// ensureFuseDeviceAccess grants access to /dev/fuse when the higher-level
-// container manager explicitly bind-mounts that device into the container.
-// Kubernetes represents hostPath character devices as mounts rather than OCI
-// devices, so add the matching OCI device and cgroup rule here.
+func ensureFuseDeviceMount(spec *specs.Spec, source string) error {
+	for _, mount := range spec.Mounts {
+		if filepath.Clean(mount.Destination) == fuseDevicePath {
+			return nil
+		}
+	}
+
+	info, err := os.Stat(source)
+	if err != nil {
+		return fmt.Errorf("cannot access host %s: %w", source, err)
+	}
+	if info.Mode()&os.ModeCharDevice == 0 {
+		return fmt.Errorf("host %s is not a character device", source)
+	}
+	spec.Mounts = append(spec.Mounts, specs.Mount{
+		Destination: fuseDevicePath,
+		Source:      source,
+		Type:        "bind",
+		Options:     []string{"rbind", "rprivate"},
+	})
+	return nil
+}
+
+// ensureFuseDeviceAccess grants access to the default or explicitly mounted
+// /dev/fuse device. Kubernetes hostPath character devices appear as OCI mounts.
 func ensureFuseDeviceAccess(spec *specs.Spec) {
 	hasFuseMount := false
 	for _, mount := range spec.Mounts {
@@ -1260,11 +1284,11 @@ func getSysboxEnvVarConfigs(p *specs.Process, sbox *sysbox.Sysbox) error {
 		"SYSBOX_SKIP_UID_SHIFT":      "string",
 		// SYSBOX_VERSION is embedded by the Sysbox deployment image and is
 		// informational; accept it without applying runtime configuration.
-		"SYSBOX_VERSION":              "string",
+		"SYSBOX_VERSION": "string",
 		// Inner CKM launcher controls are consumed by the image entrypoint.
 		// They are informational to the outer runtime and must pass through.
-		"SYSBOX_INNER_START_DAEMONS":  "string",
-		"SYSBOX_INNER_LOG_DIR":        "string",
+		"SYSBOX_INNER_START_DAEMONS": "string",
+		"SYSBOX_INNER_LOG_DIR":       "string",
 	}
 
 	for _, ev := range p.Env {

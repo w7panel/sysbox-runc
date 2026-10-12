@@ -237,11 +237,46 @@ func TestEnsureFuseDeviceAccess(t *testing.T) {
 	}
 }
 
-func TestEnsureFuseDeviceAccessRequiresExplicitMount(t *testing.T) {
+func TestEnsureFuseDeviceMount(t *testing.T) {
+	spec := &specs.Spec{Linux: &specs.Linux{}}
+	if err := ensureFuseDeviceMount(spec, "/dev/null"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureFuseDeviceMount(spec, "/dev/null"); err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.Mounts) != 1 || spec.Mounts[0].Destination != fuseDevicePath || spec.Mounts[0].Source != "/dev/null" || spec.Mounts[0].Type != "bind" {
+		t.Fatalf("expected one FUSE device mount, got %#v", spec.Mounts)
+	}
+	ensureFuseDeviceAccess(spec)
+	if len(spec.Linux.Devices) != 1 || spec.Linux.Resources == nil || len(spec.Linux.Resources.Devices) != 1 {
+		t.Fatalf("expected FUSE device access, got %#v", spec.Linux)
+	}
+}
+
+func TestEnsureFuseDeviceMountPreservesExplicitMount(t *testing.T) {
+	spec := &specs.Spec{Mounts: []specs.Mount{{Destination: fuseDevicePath, Source: "/explicit/fuse", Type: "bind"}}}
+	if err := ensureFuseDeviceMount(spec, "/does/not/exist"); err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.Mounts) != 1 || spec.Mounts[0].Source != "/explicit/fuse" {
+		t.Fatalf("explicit mount changed: %#v", spec.Mounts)
+	}
+}
+
+func TestEnsureFuseDeviceMountRejectsMissingOrNonDeviceSource(t *testing.T) {
+	for _, source := range []string{"/does/not/exist", t.TempDir()} {
+		if err := ensureFuseDeviceMount(&specs.Spec{}, source); err == nil {
+			t.Fatalf("expected %q to be rejected", source)
+		}
+	}
+}
+
+func TestEnsureFuseDeviceAccessRequiresMount(t *testing.T) {
 	spec := &specs.Spec{Linux: &specs.Linux{}}
 	ensureFuseDeviceAccess(spec)
 	if len(spec.Linux.Devices) != 0 || spec.Linux.Resources != nil {
-		t.Fatalf("fuse access must not be added without an explicit mount: %#v", spec.Linux)
+		t.Fatalf("fuse access must not be added without a mount: %#v", spec.Linux)
 	}
 }
 
