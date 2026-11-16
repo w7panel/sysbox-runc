@@ -20,6 +20,8 @@ package sysbox
 
 import (
 	"fmt"
+	"github.com/nestybox/sysbox-runc/libcontainer/system"
+	"os"
 	"time"
 
 	"github.com/nestybox/sysbox-ipc/sysboxFsGrpc"
@@ -29,13 +31,14 @@ import (
 
 // FsRegInfo contains info about a sys container registered with sysbox-fs
 type FsRegInfo struct {
-	Hostname      string
-	Pid           int
-	Uid           int
-	Gid           int
-	IdSize        int
-	ProcRoPaths   []string
-	ProcMaskPaths []string
+	ResourceCacheTTL string
+	Hostname         string
+	Pid              int
+	Uid              int
+	Gid              int
+	IdSize           int
+	ProcRoPaths      []string
+	ProcMaskPaths    []string
 }
 
 type Fs struct {
@@ -119,6 +122,30 @@ func (fs *Fs) Register(info *FsRegInfo) error {
 		ProcRoPaths:   info.ProcRoPaths,
 		ProcMaskPaths: info.ProcMaskPaths,
 	}
+
+	if info.ResourceCacheTTL != "" {
+		ttl, err := time.ParseDuration(info.ResourceCacheTTL)
+		if err != nil || ttl <= 0 {
+			return fmt.Errorf("sysbox/resource-cache-ttl must be a positive duration")
+		}
+		data.ResourceCacheTtlNanos = int64(ttl)
+	}
+
+	// Capture the final init identity after runtime namespace/cgroup setup.
+	cgroup, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", info.Pid))
+	if err != nil {
+		return fmt.Errorf("read init cgroup: %w", err)
+	}
+	data.CgroupData = string(cgroup)
+	data.Pidns, err = os.Readlink(fmt.Sprintf("/proc/%d/ns/pid", info.Pid))
+	if err != nil {
+		return fmt.Errorf("read init pid namespace: %w", err)
+	}
+	stat, err := system.Stat(info.Pid)
+	if err != nil {
+		return fmt.Errorf("read init start time: %w", err)
+	}
+	data.InitStartTime = stat.StartTime
 
 	if err := sysboxFsGrpc.SendContainerRegistration(data); err != nil {
 		return fmt.Errorf("failed to register with sysbox-fs: %v", err)

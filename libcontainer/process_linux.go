@@ -650,13 +650,14 @@ func (p *initProcess) registerWithSysboxfs(childPid int) error {
 	}
 
 	info := &sysbox.FsRegInfo{
-		Hostname:      c.config.Hostname,
-		Pid:           childPid,
-		Uid:           c.config.UidMappings[0].HostID,
-		Gid:           c.config.GidMappings[0].HostID,
-		IdSize:        c.config.UidMappings[0].Size,
-		ProcRoPaths:   procRoPaths,
-		ProcMaskPaths: procMaskPaths,
+		ResourceCacheTTL: utils.SearchLabels(c.config.Labels, "sysbox/resource-cache-ttl"),
+		Hostname:         c.config.Hostname,
+		Pid:              childPid,
+		Uid:              c.config.UidMappings[0].HostID,
+		Gid:              c.config.GidMappings[0].HostID,
+		IdSize:           c.config.UidMappings[0].Size,
+		ProcRoPaths:      procRoPaths,
+		ProcMaskPaths:    procMaskPaths,
 	}
 
 	// Launch registration process.
