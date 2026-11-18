@@ -31,14 +31,13 @@ import (
 
 // FsRegInfo contains info about a sys container registered with sysbox-fs
 type FsRegInfo struct {
-	ResourceCacheTTL string
-	Hostname         string
-	Pid              int
-	Uid              int
-	Gid              int
-	IdSize           int
-	ProcRoPaths      []string
-	ProcMaskPaths    []string
+	Hostname      string
+	Pid           int
+	Uid           int
+	Gid           int
+	IdSize        int
+	ProcRoPaths   []string
+	ProcMaskPaths []string
 }
 
 type Fs struct {
@@ -121,14 +120,6 @@ func (fs *Fs) Register(info *FsRegInfo) error {
 		GidSize:       int32(info.IdSize),
 		ProcRoPaths:   info.ProcRoPaths,
 		ProcMaskPaths: info.ProcMaskPaths,
-	}
-
-	if info.ResourceCacheTTL != "" {
-		ttl, err := time.ParseDuration(info.ResourceCacheTTL)
-		if err != nil || ttl <= 0 {
-			return fmt.Errorf("sysbox/resource-cache-ttl must be a positive duration")
-		}
-		data.ResourceCacheTtlNanos = int64(ttl)
 	}
 
 	// Capture the final init identity after runtime namespace/cgroup setup.
